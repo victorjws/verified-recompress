@@ -1,0 +1,11 @@
+//! Re-encodes files on a Filen cloud drive into more efficient formats without
+//! losing data, driving rclone's Filen backend.
+//!
+//! The crate is split into a library and a thin binary so integration tests can
+//! exercise the same code paths the CLI uses.
+
+pub mod cli;
+pub mod config;
+pub mod ledger;
+pub mod preflight;
+pub mod remote;

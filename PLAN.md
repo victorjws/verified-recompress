@@ -6,7 +6,7 @@ Full design: `~/.claude/plans/filen-graceful-gadget.md`
 
 ### Steps
 - [x] 1. 스켈레톤 — Cargo.toml, `cli.rs`, `config.rs`, `preflight.rs` (44 tests green)
-- [ ] 2. Remote + 인벤토리 — `remote/rclone.rs`, `ledger.rs`, `scan`
+- [x] 2. Remote + 인벤토리 — `remote/{mod,rcd,rclone_cli}.rs`, `ledger.rs`, `scan` (81 tests green)
 - [ ] 3. 분류 + 정책 + `plan`
 - [ ] 4. 이미지·오디오 변환 + 검증 (로컬)
 - [ ] 5. 스테이징 + `run` 파이프라인 (dry-run)
@@ -32,6 +32,13 @@ Full design: `~/.claude/plans/filen-graceful-gadget.md`
 - 세마포어 permit은 MiB 단위. `Semaphore::acquire_many` 가 `u32` 라 바이트로는 4GB에서 터진다.
 - SVT-AV1 4.2.0 `--lp` 는 코어 수가 아니라 `[0,6]` 병렬화 레벨. 코어 제한은 `taskset -c`.
 - SVT-AV1 4.2.0 `--tune` 기본값이 1(PSNR)이라 VMAF를 부풀린다. `tune=0` 명시. `tune=5`(VMAF) 금지.
+- `lsjson`과 RC `operations/list`는 경로 기준이 다르다. lsjson은 나열한 디렉터리 기준,
+  operations/list는 `fs` 기준(= `remote` 하위경로가 Path에 이미 포함). 스코프를 두 번 붙이면
+  `sub/sub/b.txt` 가 된다. 파리티 테스트가 이걸 잡았다.
+- rclone 종료 코드로 부재(3=dir, 4=file)와 실패(1=usage, 2=기타, 5=일시적, 7=치명)를 구분할 것.
+  전부 `Ok(None)` 으로 삼키면 네트워크 장애가 "파일 없음"이 되어 원본을 지울 수 있다.
+- `rand` 0.10 은 `random_range` 를 `Rng` 에서 `RngExt` 로 옮겼다.
+- lib + bin 분리 유지. 바이너리 단독이면 테스트 전용 공개 API가 dead_code 로 잡힌다.
 
 ### Status
-1단계 완료. 2단계(Remote + 인벤토리) 대기 중.
+2단계 완료. 3단계(분류 + 정책 + plan) 대기 중.
