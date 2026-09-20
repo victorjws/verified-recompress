@@ -1,0 +1,11 @@
+/target
+
+# IDE
+/.idea/
+/.vscode/
+
+# Local runtime state
+/staging/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
