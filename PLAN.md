@@ -7,7 +7,7 @@ Full design: `~/.claude/plans/filen-graceful-gadget.md`
 ### Steps
 - [x] 1. 스켈레톤 — Cargo.toml, `cli.rs`, `config.rs`, `preflight.rs` (44 tests green)
 - [x] 2. Remote + 인벤토리 — `remote/{mod,rcd,rclone_cli}.rs`, `ledger.rs`, `scan` (81 tests green)
-- [ ] 3. 분류 + 정책 + `plan`
+- [x] 3. 분류 + 정책 + `plan` — `classify.rs`, `policy.rs`, `report.rs` (133 tests green)
 - [ ] 4. 이미지·오디오 변환 + 검증 (로컬)
 - [ ] 5. 스테이징 + `run` 파이프라인 (dry-run)
 - [ ] 6. 쓰기 경로 + 휴지통 정책 + `cleanup`
@@ -39,6 +39,10 @@ Full design: `~/.claude/plans/filen-graceful-gadget.md`
   전부 `Ok(None)` 으로 삼키면 네트워크 장애가 "파일 없음"이 되어 원본을 지울 수 있다.
 - `rand` 0.10 은 `random_range` 를 `Rng` 에서 `RngExt` 로 옮겼다.
 - lib + bin 분리 유지. 바이너리 단독이면 테스트 전용 공개 API가 dead_code 로 잡힌다.
+- ffprobe `format_name` 은 단일 값이 아니라 `mov,mp4,m4a,3gp,3g2,mj2` 같은 콤마 목록이다.
+- 영상 저비트레이트 게이트는 면적으로 정규화한 bits/pixel/sec 1.0 (= 1080p 2Mbps, 4K 8Mbps).
+  0.03 으로 뒀다가 게이트가 아예 발동하지 않는 버그를 테스트가 잡았다.
+- `plan` 은 다운로드하지 않으므로 영상은 needs_probe 로 남는다. 추정치를 지어내지 말 것.
 
 ### Status
-2단계 완료. 3단계(분류 + 정책 + plan) 대기 중.
+3단계 완료. 4단계(이미지·오디오 변환 + 검증) 대기 중.

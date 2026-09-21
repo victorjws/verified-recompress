@@ -85,6 +85,10 @@ enum Cmd {
     Counts {
         reply: oneshot::Sender<Result<Counts>>,
     },
+    ListByState {
+        state: State,
+        reply: oneshot::Sender<Result<Vec<FileRow>>>,
+    },
     ClaimNext {
         reply: oneshot::Sender<Result<Option<FileRow>>>,
     },
@@ -160,6 +164,11 @@ impl Ledger {
         self.send(|reply| Cmd::Counts { reply }).await
     }
 
+    /// All rows in one state, largest first. Used by `plan` to project a whole run.
+    pub async fn list_by_state(&self, state: State) -> Result<Vec<FileRow>> {
+        self.send(|reply| Cmd::ListByState { state, reply }).await
+    }
+
     /// Atomically takes the next pending file. Because the actor is the only writer,
     /// two concurrent callers can never receive the same row.
     pub async fn claim_next(&self) -> Result<Option<FileRow>> {
@@ -223,6 +232,9 @@ fn actor_loop(mut conn: Connection, mut rx: mpsc::Receiver<Cmd>) {
             }
             Cmd::Counts { reply } => {
                 let _ = reply.send(do_counts(&conn));
+            }
+            Cmd::ListByState { state, reply } => {
+                let _ = reply.send(do_list_by_state(&conn, state));
             }
             Cmd::ClaimNext { reply } => {
                 let _ = reply.send(do_claim_next(&mut conn));
@@ -347,6 +359,16 @@ fn do_counts(conn: &Connection) -> Result<Counts> {
         }
     }
     Ok(counts)
+}
+
+fn do_list_by_state(conn: &Connection, state: State) -> Result<Vec<FileRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT path, size, mod_time, blake3, state, skip_reason
+         FROM files WHERE state = ?1 ORDER BY size DESC, path",
+    )?;
+    let rows = stmt.query_map(params![state.as_str()], row_to_file)?;
+    rows.map(|r| r.map_err(anyhow::Error::from).and_then(build_row))
+        .collect()
 }
 
 fn do_claim_next(conn: &mut Connection) -> Result<Option<FileRow>> {

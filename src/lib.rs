@@ -4,8 +4,11 @@
 //! The crate is split into a library and a thin binary so integration tests can
 //! exercise the same code paths the CLI uses.
 
+pub mod classify;
 pub mod cli;
 pub mod config;
 pub mod ledger;
+pub mod policy;
 pub mod preflight;
 pub mod remote;
+pub mod report;

@@ -5,9 +5,11 @@ use tracing_subscriber::EnvFilter;
 
 use storage_optimizer::cli::{Cli, Command};
 use storage_optimizer::config::{self, Config, FileConfig};
-use storage_optimizer::ledger::Ledger;
+use storage_optimizer::ledger::{Ledger, State};
+use storage_optimizer::policy::{self, Limits};
 use storage_optimizer::preflight;
 use storage_optimizer::remote::{Remote, rcd::RcdRemote};
+use storage_optimizer::report::Projection;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -43,7 +45,7 @@ async fn main() -> Result<()> {
             }
             bail!("`run` is not implemented yet (step 5 of the plan)")
         }
-        Command::Plan => bail!("not implemented yet (step 3 of the plan)"),
+        Command::Plan => run_plan(&cfg).await,
         Command::Bench { .. } => bail!("not implemented yet (step 7 of the plan)"),
         Command::Report | Command::Verify { .. } | Command::Restore { .. } => {
             bail!("not implemented yet (step 6-8 of the plan)")
@@ -106,6 +108,36 @@ async fn run_scan(cfg: &Config) -> Result<()> {
         counts.failed,
         format_size(counts.total_bytes, DECIMAL)
     );
+    Ok(())
+}
+
+/// Projects what a run would achieve, from the inventory alone.
+///
+/// Deliberately does not download anything, which is why video resolves to
+/// "needs a probe" rather than a guess: probing a remote file means fetching it.
+async fn run_plan(cfg: &Config) -> Result<()> {
+    let ledger = Ledger::open(&cfg.staging_dir.join("ledger.sqlite"))?;
+    let rows = ledger.list_by_state(State::Pending).await?;
+    if rows.is_empty() {
+        println!("No pending files. Run `scan` first.");
+        return Ok(());
+    }
+
+    let limits = Limits {
+        max_file_bytes: u64::from(cfg.max_file_mib) * 1024 * 1024,
+        // `plan` reports what the lossless tiers alone would do; the AV1 tier needs
+        // both a probe and --allow-video, so including it here would overpromise.
+        allow_video: false,
+    };
+
+    let mut projection = Projection::default();
+    for row in &rows {
+        let facts = policy::Facts::new(&row.path, row.size);
+        projection.record(policy::decide(facts, limits), row.size);
+    }
+
+    println!("{} pending file(s) in the inventory.\n", rows.len());
+    print!("{projection}");
     Ok(())
 }
 
