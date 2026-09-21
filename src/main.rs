@@ -9,6 +9,8 @@ use tokio_util::sync::CancellationToken;
 
 use storage_optimizer::cli::{Cli, Command, RunArgs};
 use storage_optimizer::config::{self, Config, FileConfig, TrashPolicy};
+use storage_optimizer::bench;
+use storage_optimizer::convert;
 use storage_optimizer::governor::Governor;
 use storage_optimizer::ledger::{Ledger, State};
 use storage_optimizer::pipeline::{self, Pipeline};
@@ -55,7 +57,7 @@ async fn main() -> Result<()> {
             run_convert(&cfg, args).await
         }
         Command::Plan => run_plan(&cfg).await,
-        Command::Bench { .. } => bail!("not implemented yet (step 7 of the plan)"),
+        Command::Bench { sample } => run_bench(&cfg, *sample).await,
         Command::Report => run_report(&cfg).await,
         Command::Verify { .. } | Command::Restore { .. } => {
             bail!("not implemented yet (step 8 of the plan)")
@@ -224,6 +226,12 @@ async fn run_convert(cfg: &Config, args: &RunArgs) -> Result<()> {
             allow_video: args.allow_video,
             limit: args.limit,
             scope: Scope::new(&cfg.paths, &cfg.exclude)?,
+            video: convert::VideoOptions {
+                preset: args.preset,
+                temporal_filtering_off: false,
+                hwaccel: preflight::has_cuda().await,
+                allow_discard_corrupt: args.allow_discard_corrupt,
+            },
         })
         .await?;
 
@@ -354,6 +362,60 @@ async fn run_cleanup(cfg: &Config, execute: bool) -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// Encodes real samples at several settings so the choice is made on evidence.
+async fn run_bench(cfg: &Config, sample: usize) -> Result<()> {
+    let ledger = Ledger::open(&cfg.staging_dir.join("ledger.sqlite"))?;
+    let scope = Scope::new(&cfg.paths, &cfg.exclude)?;
+
+    // Biggest first: those are the files the settings actually matter for.
+    let candidates: Vec<_> = ledger
+        .list_by_state(State::Pending)
+        .await?
+        .into_iter()
+        .filter(|row| scope.allows(&row.path))
+        .filter(|row| storage_optimizer::classify::kind_from_extension(&row.path).is_video())
+        .take(sample)
+        .collect();
+
+    if candidates.is_empty() {
+        println!("No pending video files to benchmark. Run `scan` first.");
+        return Ok(());
+    }
+
+    let remote = RcdRemote::spawn(cfg.remote.clone(), None).await?;
+    let hwaccel = preflight::has_cuda().await;
+    let work = tempfile::tempdir()?;
+    let mut report = bench::Report::default();
+
+    for (index, row) in candidates.iter().enumerate() {
+        println!("\nSample {}/{}: {}", index + 1, candidates.len(), row.path);
+        let local = work.path().join(format!("sample{index}.bin"));
+        remote.download(&row.path, &local).await?;
+
+        for preset in bench::PRESETS {
+            match bench::measure_one(&local, work.path(), preset, true, 26, &[], hwaccel).await {
+                Ok(row) => report.rows.push(row),
+                Err(e) => tracing::warn!("preset {preset} failed: {e:#}"),
+            }
+        }
+        // Temporal filtering trades detail for bytes, and VMAF is not good at
+        // spotting the difference, so it is measured rather than assumed.
+        match bench::measure_one(&local, work.path(), bench::PRESETS[0], false, 26, &[], hwaccel).await {
+            Ok(row) => report.rows.push(row),
+            Err(e) => tracing::warn!("temporal-filtering comparison failed: {e:#}"),
+        }
+        let _ = tokio::fs::remove_file(&local).await;
+    }
+
+    remote.shutdown().await?;
+    println!("\n{report}");
+    println!(
+        "  VMAF alone cannot see oversmoothing. Before settling on a preset, pull a\n           few frames from each and look at them, and diff the metadata with:\n             exiftool -a -G1 <original> <converted>\n           Tags worth checking: {}",
+        bench::tracked_tags().join(", ")
+    );
     Ok(())
 }
 

@@ -11,6 +11,8 @@
 
 pub mod audio;
 pub mod jxl;
+pub mod video_av1;
+pub mod video_lossless;
 
 use std::path::Path;
 use std::process::Stdio;
@@ -54,6 +56,8 @@ pub enum ContentHash {
     Pixels(String),
     /// MD5 of decoded PCM samples.
     Pcm(String),
+    /// Per-stream digests of encoded data, for verifying a stream copy.
+    Streams(video_lossless::StreamDigest),
 }
 
 /// Takes whatever digests the recipe's verification will need.
@@ -69,21 +73,73 @@ pub async fn fingerprint(recipe: Recipe, input: &Path) -> Result<Fingerprint> {
         Recipe::Flac | Recipe::FlacRecompress => {
             Some(ContentHash::Pcm(hash::pcm_md5(input).await?))
         }
-        Recipe::TsRemux | Recipe::Ffv1 | Recipe::Av1 => None,
+        // A remux copies encoded data, so the digests are of the streams
+        // themselves rather than of anything decoded.
+        Recipe::TsRemux => Some(ContentHash::Streams(
+            video_lossless::StreamDigest::of(input).await?,
+        )),
+        Recipe::Ffv1 => Some(ContentHash::Pixels(hash::frame_hash(input).await?)),
+        // AV1 is scored against the source directly, so there is nothing to
+        // record in advance.
+        Recipe::Av1 => None,
     };
     Ok(Fingerprint { sha256, content })
 }
 
+/// Options that only the video recipes need.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VideoOptions {
+    pub preset: Option<u8>,
+    pub temporal_filtering_off: bool,
+    pub hwaccel: bool,
+    /// Lets ffmpeg drop damaged transport-stream packets. Makes the remux lossy,
+    /// so it is opt-in and recorded as such.
+    pub allow_discard_corrupt: bool,
+}
+
+impl VideoOptions {
+    fn settings(self) -> video_av1::Settings {
+        video_av1::Settings {
+            preset: self.preset.unwrap_or(video_av1::DEFAULT_PRESET),
+            temporal_filtering: !self.temporal_filtering_off,
+            hwaccel: self.hwaccel,
+        }
+    }
+}
+
 /// Encodes `input` to `output` according to `recipe`.
-pub async fn encode(recipe: Recipe, input: &Path, output: &Path, cores: &[usize]) -> Result<()> {
+///
+/// AV1 is absent here: it cannot be separated from its measurement, because the
+/// CRF is chosen by scoring the result. [`convert_av1`] does both.
+pub async fn encode(
+    recipe: Recipe,
+    input: &Path,
+    output: &Path,
+    cores: &[usize],
+    video: VideoOptions,
+) -> Result<()> {
     match recipe {
         Recipe::JxlFromJpeg => jxl::encode_from_jpeg(input, output, cores).await,
         Recipe::JxlFromRaster => jxl::encode_from_raster(input, output, cores).await,
         Recipe::Flac | Recipe::FlacRecompress => audio::encode_flac(input, output, cores).await,
-        Recipe::TsRemux | Recipe::Ffv1 | Recipe::Av1 => {
-            bail!("the video tier is not wired up yet")
+        Recipe::TsRemux => {
+            video_lossless::remux_to_mp4(input, output, cores, video.allow_discard_corrupt).await
         }
+        Recipe::Ffv1 => video_lossless::encode_ffv1(input, output, cores).await,
+        Recipe::Av1 => bail!("AV1 encoding goes through convert_av1, which also scores it"),
     }
+}
+
+/// Encodes to AV1 and proves the result clears the quality gate.
+pub async fn convert_av1(
+    input: &Path,
+    output: &Path,
+    probe: &crate::classify::MediaProbe,
+    work_dir: &Path,
+    cores: &[usize],
+    video: VideoOptions,
+) -> Result<(Fidelity, video_av1::Attempt)> {
+    video_av1::encode_to_gate(input, output, probe, &video.settings(), work_dir, cores).await
 }
 
 /// Proves the encode preserved what the recipe promises.
@@ -111,9 +167,19 @@ pub async fn verify(
             };
             audio::verify_flac(output, &fingerprint.sha256, expected, work_dir, cores).await
         }
-        Recipe::TsRemux | Recipe::Ffv1 | Recipe::Av1 => {
-            bail!("the video tier is not wired up yet")
+        Recipe::TsRemux => {
+            let Some(ContentHash::Streams(expected)) = &fingerprint.content else {
+                bail!("a remux needs stream digests");
+            };
+            video_lossless::verify_remux(output, expected).await
         }
+        Recipe::Ffv1 => {
+            let Some(ContentHash::Pixels(expected)) = &fingerprint.content else {
+                bail!("an FFV1 conversion needs a pixel fingerprint");
+            };
+            video_lossless::verify_frames(output, expected).await
+        }
+        Recipe::Av1 => bail!("AV1 is verified as part of convert_av1"),
     }
 }
 

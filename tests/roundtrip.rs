@@ -65,7 +65,9 @@ fn size(path: &Path) -> u64 {
 async fn round_trip(recipe: Recipe, input: &Path, work: &Work, out_name: &str) -> (Fidelity, u64, u64) {
     let output = work.path(out_name);
     let fp = convert::fingerprint(recipe, input).await.unwrap();
-    convert::encode(recipe, input, &output, &[]).await.unwrap();
+    convert::encode(recipe, input, &output, &[], Default::default())
+        .await
+        .unwrap();
     let fidelity = convert::verify(recipe, &output, &fp, work.dir.path(), &[])
         .await
         .unwrap();
@@ -158,7 +160,7 @@ async fn a_damaged_raster_output_fails_verification() {
         &["-f", "lavfi", "-i", "testsrc2=size=320x240:rate=1", "-frames:v", "1", "-vf", "negate"],
     );
     let output = work.path("out.jxl");
-    convert::encode(Recipe::JxlFromRaster, &other, &output, &[])
+    convert::encode(Recipe::JxlFromRaster, &other, &output, &[], Default::default())
         .await
         .unwrap();
 
@@ -202,7 +204,7 @@ async fn flac_output_that_does_not_match_the_source_fails() {
 
     let fp = convert::fingerprint(Recipe::Flac, &input).await.unwrap();
     let output = work.path("out.flac");
-    convert::encode(Recipe::Flac, &other, &output, &[])
+    convert::encode(Recipe::Flac, &other, &output, &[], Default::default())
         .await
         .unwrap();
 
@@ -247,7 +249,7 @@ async fn verification_works_after_the_source_is_deleted() {
     let output = work.path("out.jxl");
 
     let fp = convert::fingerprint(Recipe::JxlFromJpeg, &input).await.unwrap();
-    convert::encode(Recipe::JxlFromJpeg, &input, &output, &[])
+    convert::encode(Recipe::JxlFromJpeg, &input, &output, &[], Default::default())
         .await
         .unwrap();
     std::fs::remove_file(&input).unwrap();

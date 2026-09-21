@@ -114,15 +114,65 @@ pub async fn pcm_md5(path: &Path) -> Result<String> {
     Ok(value.trim().to_string())
 }
 
-/// Keeps only the per-frame rows of a `framehash` dump.
+/// Number of video frames, used to catch packets silently dropped in a remux.
+pub async fn video_frame_count(path: &Path) -> Result<u64> {
+    let output = Command::new("ffprobe")
+        .args([
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-count_packets",
+            "-show_entries", "stream=nb_read_packets",
+            "-of", "csv=p=0",
+        ])
+        .arg(path)
+        .output()
+        .await
+        .context("failed to execute ffprobe")?;
+
+    if !output.status.success() {
+        bail!(
+            "ffprobe could not count frames in {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    // A transport stream reports the count twice, once per program, separated by
+    // a blank line: `30\n\n30\n`. Take the first value rather than trying to
+    // parse the lot.
+    //
+    // Failing loudly matters here. Defaulting to zero would make the frame-count
+    // comparison pass trivially on both sides, which is the opposite of what it
+    // is for.
+    parse_frame_count(&String::from_utf8_lossy(&output.stdout))
+        .with_context(|| format!("could not read a frame count for {}", path.display()))
+}
+
+fn parse_frame_count(raw: &str) -> Option<u64> {
+    raw.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .and_then(|l| l.parse().ok())
+}
+
+/// Extracts just the per-frame picture hashes from a `framehash` dump.
 ///
-/// The header carries fields that legitimately differ between two files holding
-/// identical pixels: re-encoding a PNG through JPEG XL flips `#sar` from `1/1` to
-/// `0/1`, for instance. Comparing the whole dump would report a loss that did not
-/// happen.
+/// Only the hash column is kept, in frame order. Everything else on the line is
+/// container bookkeeping that legitimately differs between two files holding
+/// identical pixels:
+///
+/// - the header carries `#sar`, which a JPEG XL round trip flips from `1/1` to `0/1`
+/// - each row starts with dts, pts and duration, expressed in the container's own
+///   timebase, so the same stream reads `0, 1, 2` in a transport stream and
+///   `0, 512, 1024` once it is in MP4
+///
+/// Comparing whole lines therefore reports losses that did not happen. Frame
+/// count is checked separately by [`video_frame_count`], and keeping the hashes
+/// in order still catches reordering.
 fn extract_hash_lines(raw: &str) -> String {
     raw.lines()
         .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        .filter_map(|l| l.rsplit(',').next())
+        .map(str::trim)
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -171,11 +221,11 @@ mod tests {
     }
 
     #[test]
-    fn extracts_only_frame_rows() {
-        let lines = extract_hash_lines(ORIGINAL);
-        assert_eq!(lines.lines().count(), 1);
-        assert!(lines.starts_with("0,"));
-        assert!(lines.contains("b78b3172"));
+    fn extracts_only_the_hash_column() {
+        assert_eq!(
+            extract_hash_lines(ORIGINAL),
+            "b78b3172712b3102d41639b1bc0fd4a4d39ea325e7c2f780a8a41b84f63b637b"
+        );
     }
 
     #[test]
@@ -187,12 +237,54 @@ mod tests {
     #[test]
     fn multi_frame_output_keeps_every_row() {
         let raw = "#format: frame checksums\n0, 0, 0, 1, 100, aaa\n0, 1, 1, 1, 100, bbb\n";
-        assert_eq!(extract_hash_lines(raw).lines().count(), 2);
+        assert_eq!(extract_hash_lines(raw), "aaa\nbbb");
+    }
+
+    /// Timestamps are expressed in the container's own timebase, so the same
+    /// stream reads differently in a transport stream and in MP4 even though every
+    /// picture is identical. Captured from a real 25fps remux.
+    #[test]
+    fn container_timebases_do_not_count_as_pixel_differences() {
+        let ts = "\
+#tb 0: 1/25
+0,          0,          0,        1,   460800, dbb17381286adfadc02887f3d7d9dfd88
+0,          1,          1,        1,   460800, dd1178d0cfe3b5009c58b763eb22c3837
+";
+        let mp4 = "\
+#tb 0: 1/12800
+0,          0,          0,      512,   460800, dbb17381286adfadc02887f3d7d9dfd88
+0,        512,        512,      512,   460800, dd1178d0cfe3b5009c58b763eb22c3837
+";
+        assert_ne!(ts, mp4, "the fixtures should differ overall");
+        assert_eq!(extract_hash_lines(ts), extract_hash_lines(mp4));
+    }
+
+    /// Reordered frames must still be caught: order is preserved in the output.
+    #[test]
+    fn reordered_frames_are_detected() {
+        let forward = "0, 0, 0, 1, 1, aaa\n0, 1, 1, 1, 1, bbb";
+        let reversed = "0, 0, 0, 1, 1, bbb\n0, 1, 1, 1, 1, aaa";
+        assert_ne!(extract_hash_lines(forward), extract_hash_lines(reversed));
     }
 
     #[test]
     fn blank_lines_are_ignored() {
-        assert_eq!(extract_hash_lines("#h\n\n0, 0, 0, 1, 1, aa\n\n"), "0, 0, 0, 1, 1, aa");
+        assert_eq!(extract_hash_lines("#h\n\n0, 0, 0, 1, 1, aa\n\n"), "aa");
+    }
+
+    /// A transport stream reports its packet count once per program, so the raw
+    /// output has a blank line and a repeat in it.
+    #[test]
+    fn frame_count_survives_the_transport_stream_layout() {
+        assert_eq!(parse_frame_count("30\n"), Some(30));
+        assert_eq!(parse_frame_count("30\n\n30\n"), Some(30));
+        assert_eq!(parse_frame_count("  42  \n"), Some(42));
+    }
+
+    #[test]
+    fn an_unreadable_frame_count_is_not_silently_zero() {
+        assert_eq!(parse_frame_count(""), None);
+        assert_eq!(parse_frame_count("N/A\n"), None);
     }
 
     #[tokio::test]

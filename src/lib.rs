@@ -4,6 +4,7 @@
 //! The crate is split into a library and a thin binary so integration tests can
 //! exercise the same code paths the CLI uses.
 
+pub mod bench;
 pub mod classify;
 pub mod cli;
 pub mod config;
@@ -19,3 +20,4 @@ pub mod report;
 pub mod scope;
 pub mod staging;
 pub mod trash;
+pub mod vmaf;

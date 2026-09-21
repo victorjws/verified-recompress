@@ -447,6 +447,16 @@ pub async fn run(cfg: &Config) -> Result<Report> {
     Ok(report)
 }
 
+/// Whether ffmpeg can decode on the GPU.
+///
+/// Only a speed question: VMAF has to decode two streams at once, and moving that
+/// off the CPU leaves the cores for encoding. Its absence changes nothing else.
+pub async fn has_cuda() -> bool {
+    capture("ffmpeg", &["-hide_banner", "-hwaccels"])
+        .await
+        .is_some_and(|text| text.contains("cuda"))
+}
+
 /// The tool names above are all string literals; this keeps `Finding` on `&'static str`.
 fn leak(name: &str) -> &'static str {
     match name {

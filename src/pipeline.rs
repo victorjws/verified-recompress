@@ -13,7 +13,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -75,6 +75,8 @@ pub struct Options {
     pub limit: Option<usize>,
     /// Which files this run may touch.
     pub scope: Scope,
+    /// Encoder settings the video recipes need.
+    pub video: convert::VideoOptions,
 }
 
 pub struct Pipeline<R: Remote + 'static> {
@@ -224,21 +226,40 @@ impl<R: Remote + 'static> Pipeline<R> {
             Decision::Skip(reason) => return self.record_skip(&row.path, reason).await,
         };
 
-        let fingerprint = convert::fingerprint(recipe, &input).await?;
-
         let output = workspace.output(recipe.output_extension(extension_of(&row.path)));
-        {
+
+        // AV1 chooses its own CRF by scoring the result, so encoding and
+        // verification are one step; every other recipe measures the source first
+        // and checks the output against that.
+        let fidelity = if recipe == Recipe::Av1 {
+            let probe = probe
+                .as_ref()
+                .context("AV1 requires a probe, which should have been taken already")?;
             let cpu = self.governor.cpu(recipe).await;
-            convert::encode(recipe, &input, &output, cpu.cores()).await?;
-        }
+            let (fidelity, attempt) = convert::convert_av1(
+                &input,
+                &output,
+                probe,
+                workspace.path(),
+                cpu.cores(),
+                opts.video,
+            )
+            .await?;
+            tracing::info!("{}: crf {}, {}", row.path, attempt.crf, attempt.scores.summary());
+            fidelity
+        } else {
+            let fingerprint = convert::fingerprint(recipe, &input).await?;
+            {
+                let cpu = self.governor.cpu(recipe).await;
+                convert::encode(recipe, &input, &output, cpu.cores(), opts.video).await?;
+            }
 
-        // Verification works from the recorded fingerprint, so the source can go now
-        // and the peak footprint stays near one copy plus the output.
-        if !keeps_source_for_verification(recipe) {
-            let _ = tokio::fs::remove_file(&input).await;
-        }
+            // Verification works from the recorded fingerprint, so the source can
+            // go now and the peak footprint stays near one copy plus the output.
+            if !keeps_source_for_verification(recipe) {
+                let _ = tokio::fs::remove_file(&input).await;
+            }
 
-        let fidelity = {
             let cpu = self.governor.cpu(recipe).await;
             convert::verify(recipe, &output, &fingerprint, workspace.path(), cpu.cores()).await?
         };
@@ -268,12 +289,22 @@ impl<R: Remote + 'static> Pipeline<R> {
             });
         }
 
-        let remote_output = swap_extension(&row.path, recipe.output_extension(extension_of(&row.path)));
+        let remote_output =
+            swap_extension(&row.path, recipe.output_extension(extension_of(&row.path)));
 
-        // Refuse to write over something that is already there. Same-extension
-        // recipes aside, a collision means an unrelated file, or the leftovers of
-        // an interrupted earlier attempt that has not been accounted for.
-        if remote_output != row.path {
+        // A recipe that keeps the container produces the same path it started
+        // from. Uploading straight over it and then deleting "the original" would
+        // delete the replacement, so the write goes to a staging name first and
+        // only takes the final path once it is confirmed. That also keeps the
+        // invariant that nothing is removed before its replacement exists.
+        let replaces_in_place = remote_output == row.path;
+        let upload_target = if replaces_in_place {
+            format!("{}.storage-optimizer-{job_id}.part", row.path)
+        } else {
+            remote_output.clone()
+        };
+
+        if !replaces_in_place {
             let _api = self.governor.api().await;
             if self.remote.stat(&remote_output).await?.is_some() {
                 bail!("{remote_output} already exists; refusing to overwrite it");
@@ -288,15 +319,21 @@ impl<R: Remote + 'static> Pipeline<R> {
         let local_hash = crate::hash::blake3_file(&output).await?;
         {
             let _net = self.governor.network().await;
-            self.remote.upload(&output, &remote_output).await?;
+            self.remote.upload(&output, &upload_target).await?;
         }
 
         // Confirm what landed before touching the original. `hashsum` is answered
         // server-side, so this costs no download.
         {
             let _api = self.governor.api().await;
-            self.confirm_upload(&remote_output, output_bytes, &local_hash)
-                .await?;
+            if let Err(e) = self
+                .confirm_upload(&upload_target, output_bytes, &local_hash)
+                .await
+            {
+                // Leave nothing half-written behind for the next run to trip over.
+                let _ = self.remote.delete(&upload_target).await;
+                return Err(e);
+            }
         }
 
         // Only now is it safe. The original goes to the trash, where it stays
@@ -304,6 +341,19 @@ impl<R: Remote + 'static> Pipeline<R> {
         {
             let _api = self.governor.api().await;
             self.remote.delete(&row.path).await?;
+        }
+
+        if replaces_in_place {
+            let _api = self.governor.api().await;
+            self.remote
+                .move_to(&upload_target, &remote_output)
+                .await
+                .with_context(|| {
+                    format!(
+                        "the replacement is uploaded but still named {upload_target}; \
+                         the original is recoverable from the trash"
+                    )
+                })?;
         }
 
         self.ledger
@@ -483,11 +533,30 @@ mod tests {
         assert_eq!(swap_extension("dir.with.dots/x.png", "jxl"), "dir.with.dots/x.jxl");
     }
 
-    /// A recipe that keeps the container produces the same path, which the write
-    /// path relies on to know it is not clobbering an unrelated file.
+    /// A recipe that keeps the container produces the same path it started from.
+    ///
+    /// This is not a curiosity: AV1 keeps the source container so QuickTime
+    /// metadata survives, so `clip.mp4` converts to `clip.mp4`. Uploading straight
+    /// over it and then deleting "the original" deletes the replacement, which is
+    /// exactly what happened before the write path staged under a temporary name.
     #[test]
     fn a_same_extension_recipe_leaves_the_path_unchanged() {
         assert_eq!(swap_extension("clip.mp4", "mp4"), "clip.mp4");
+        assert_eq!(swap_extension("videos/clip.mov", "mov"), "videos/clip.mov");
+        // Which is what the in-place branch keys off.
+        assert_eq!(Recipe::Av1.output_extension("mp4"), "mp4");
+        assert_ne!(Recipe::TsRemux.output_extension("ts"), "ts");
+    }
+
+    /// The staging name must be distinct from the file it will replace, and
+    /// recognisable enough to explain itself if a crash leaves one behind.
+    #[test]
+    fn the_in_place_staging_name_is_distinct_and_self_describing() {
+        let path = "videos/clip.mp4";
+        let staged = format!("{path}.storage-optimizer-{}.part", 7u64);
+        assert_ne!(staged, path);
+        assert!(staged.starts_with(path));
+        assert!(staged.ends_with(".part"));
     }
 
     #[test]

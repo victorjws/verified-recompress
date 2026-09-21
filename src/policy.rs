@@ -289,9 +289,9 @@ fn decide_video(kind: Kind, probe: Option<&MediaProbe>, limits: Limits) -> Decis
         return Decision::Skip(SkipReason::VideoComplexStructure);
     }
 
-    // Intra-only and uncompressed sources are the only ones that genuinely shrink
-    // losslessly, and FFV1 does it without touching a single pixel value.
-    if is_intra_lossless(&video.codec) {
+    // Uncompressed and losslessly-coded sources are the only ones FFV1 actually
+    // helps, and it helps enormously: rawvideo shrinks by around 93%.
+    if is_uncompressed_or_lossless(&video.codec) {
         return Decision::Convert(Recipe::Ffv1);
     }
 
@@ -343,20 +343,29 @@ fn decide_video(kind: Kind, probe: Option<&MediaProbe>, limits: Limits) -> Decis
     Decision::Convert(Recipe::Av1)
 }
 
-/// Codecs that store every frame independently and uncompressed or near-so.
-fn is_intra_lossless(codec: &str) -> bool {
+/// Codecs that store pixels uncompressed, or compress them without loss.
+///
+/// Only these are worth sending to FFV1. Intra-only is not the same thing as
+/// lossless: ProRes, DNxHD, DV and MJPEG are all lossy DCT codecs that happen to
+/// code each frame independently, and re-coding them losslessly preserves their
+/// existing artefacts at a size FFV1 cannot beat — measured, ProRes at 520 KB
+/// became 523 KB. They belong on the ordinary lossy path, where AV1 can actually
+/// reduce them.
+fn is_uncompressed_or_lossless(codec: &str) -> bool {
     matches!(
         codec,
-        "prores"
-            | "dnxhd"
-            | "dvvideo"
-            | "mjpeg"
-            | "rawvideo"
+        "rawvideo"
             | "huffyuv"
             | "ffvhuff"
-            | "v210"
+            | "ffv1"
+            | "magicyuv"
             | "utvideo"
             | "qtrle"
+            | "v210"
+            | "v410"
+            | "r210"
+            | "bmp"
+            | "png"
     )
 }
 
@@ -593,8 +602,8 @@ mod tests {
     }
 
     #[test]
-    fn intra_codecs_get_truly_lossless_ffv1() {
-        for codec in ["prores", "dvvideo", "mjpeg", "rawvideo", "huffyuv"] {
+    fn uncompressed_sources_get_truly_lossless_ffv1() {
+        for codec in ["rawvideo", "huffyuv", "ffvhuff", "utvideo", "v210"] {
             let probe = video(codec, 1920, 1080, 100_000_000, 120.0);
             assert_eq!(
                 decide(Facts::new("a.mov", BIG).with_probe(&probe), limits()),
@@ -604,10 +613,25 @@ mod tests {
         }
     }
 
+    /// Intra-only is not the same as lossless. ProRes, DNxHD, DV and MJPEG are
+    /// lossy DCT codecs, and coding them losslessly to FFV1 makes them *bigger*
+    /// (measured: 520 KB of ProRes became 523 KB). They belong on the lossy path.
+    #[test]
+    fn lossy_intra_codecs_do_not_go_to_ffv1() {
+        for codec in ["prores", "dnxhd", "dvvideo", "mjpeg"] {
+            let probe = video(codec, 1920, 1080, 100_000_000, 120.0);
+            assert_eq!(
+                decide(Facts::new("a.mov", BIG).with_probe(&probe), limits()),
+                Decision::Convert(Recipe::Av1),
+                "{codec}"
+            );
+        }
+    }
+
     /// FFV1 is lossless, so it does not need the --allow-video gate.
     #[test]
     fn ffv1_does_not_need_the_video_gate() {
-        let probe = video("prores", 1920, 1080, 100_000_000, 120.0);
+        let probe = video("rawvideo", 1920, 1080, 100_000_000, 120.0);
         assert_eq!(
             decide(Facts::new("a.mov", BIG).with_probe(&probe), no_video()),
             Decision::Convert(Recipe::Ffv1)

@@ -11,7 +11,7 @@ Full design: `~/.claude/plans/filen-graceful-gadget.md`
 - [x] 4. 이미지·오디오 변환 + 검증 — `convert/{mod,jxl,audio}.rs`, `hash.rs` (152 tests green)
 - [x] 5. 스테이징 + 동시성 파이프라인 — `governor.rs`, `staging.rs`, `pipeline.rs` (183 tests green)
 - [x] 6. 쓰기 경로 + 휴지통 정책 + `cleanup` + `report` + `scope.rs` (214 tests green)
-- [ ] 7. 영상 티어 — `vmaf.rs`, `convert/video_av1.rs`, `bench`
+- [x] 7. 영상 티어 — `vmaf.rs`, `convert/video_{av1,lossless}.rs`, `bench.rs` (256 tests green)
 - [ ] 8. dedup / restore
 - [ ] 9. 커밋
 
@@ -57,6 +57,17 @@ Full design: `~/.claude/plans/filen-graceful-gadget.md`
   경계에 맞춰야 `photos` 가 `photos-backup` 을 삼키지 않는다. LIKE 와일드카드 이스케이프 필수.
 - 업로드 확인은 `operations/hashsumfile`(서버측 blake3) + stat 크기. 다운로드 없이 검증된다.
 - 클라우드 permit 은 job 종료 후에도 유지(`Lease::hold`). 휴지통 비우기 전까지 여전히 과금된다.
+- **AV1 은 소스 컨테이너를 유지하므로 출력 경로 == 입력 경로.** 그대로 올리고 "원본"을 지우면
+  방금 올린 파일을 지운다 (실제로 videos/ 가 통째로 비었다). 임시 이름으로 올린 뒤 확인하고
+  move 로 자리를 차지해야 한다.
+- framehash 행에는 dts/pts/duration 이 들어 있고 컨테이너 타임베이스마다 다르다 (TS 1/25 vs
+  MP4 1/12800). **해시 컬럼만 비교할 것.** 헤더만 걸러서는 부족하다.
+- 컨테이너가 다르면 엘리멘터리 스트림 바이트도 다르다 (MP4 = AVCC 길이접두, TS = Annex B
+  스타트코드; AAC 는 ADTS vs ASC). 리먹스 검증은 디코딩된 내용으로 해야 한다.
+- 인트라 != 무손실. ProRes/DNxHD/DV/MJPEG 는 손실 DCT 코덱이라 FFV1 로 가면 **커진다**
+  (실측 520KB → 523KB). FFV1 은 rawvideo/huffyuv 등 진짜 무압축에만 (실측 93% 절감).
+- ffprobe 프레임 수는 TS 에서 `30\n\n30\n` 처럼 두 번 나온다. 첫 줄만 쓰고, 파싱 실패를
+  0 으로 삼키지 말 것 (프레임 수 비교가 무의미해진다).
 
 ### Status
-6단계 완료. 7단계(영상 티어) 대기 중.
+7단계 완료. 8단계(dedup / restore) 대기 중.
