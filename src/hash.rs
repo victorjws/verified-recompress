@@ -43,6 +43,36 @@ pub async fn sha256_file(path: &Path) -> Result<String> {
     .context("hashing task panicked")?
 }
 
+/// BLAKE3 of a file's raw bytes.
+///
+/// This is the hash Filen exposes, so an uploaded object can be checked against
+/// its local original without downloading it back.
+pub async fn blake3_file(path: &Path) -> Result<String> {
+    const CHUNK: usize = 1024 * 1024;
+
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+
+        let mut file = std::fs::File::open(&path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        let mut hasher = blake3::Hasher::new();
+        let mut buf = vec![0u8; CHUNK];
+        loop {
+            let n = file
+                .read(&mut buf)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Ok(hasher.finalize().to_hex().to_string())
+    })
+    .await
+    .context("hashing task panicked")?
+}
+
 async fn run_ffmpeg(args: &[&str], path: &Path) -> Result<String> {
     let output = Command::new("ffmpeg")
         .args(["-v", "error", "-i"])
@@ -179,5 +209,30 @@ mod tests {
     #[tokio::test]
     async fn sha256_of_a_missing_file_errors() {
         assert!(sha256_file(Path::new("/definitely/not/here")).await.is_err());
+    }
+
+    /// Must match what rclone reports for the same bytes, since upload
+    /// confirmation compares the two.
+    #[tokio::test]
+    async fn blake3_matches_the_value_rclone_reports() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"hello").unwrap();
+        file.flush().unwrap();
+        assert_eq!(
+            blake3_file(file.path()).await.unwrap(),
+            "ea8f163db38682925e4491c5e58d4bb3506ef8c14eb78a86e908c5624a67200f"
+        );
+    }
+
+    #[tokio::test]
+    async fn blake3_spans_multiple_chunks() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let data = vec![7u8; 3 * 1024 * 1024 + 17];
+        file.write_all(&data).unwrap();
+        file.flush().unwrap();
+        assert_eq!(
+            blake3_file(file.path()).await.unwrap(),
+            blake3::hash(&data).to_hex().to_string()
+        );
     }
 }

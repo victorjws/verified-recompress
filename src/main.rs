@@ -16,7 +16,9 @@ use storage_optimizer::policy::{self, Limits, SkipReason};
 use storage_optimizer::preflight;
 use storage_optimizer::remote::{Remote, rcd::RcdRemote};
 use storage_optimizer::report::Projection;
+use storage_optimizer::scope::Scope;
 use storage_optimizer::staging;
+use storage_optimizer::trash;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -54,10 +56,11 @@ async fn main() -> Result<()> {
         }
         Command::Plan => run_plan(&cfg).await,
         Command::Bench { .. } => bail!("not implemented yet (step 7 of the plan)"),
-        Command::Report | Command::Verify { .. } | Command::Restore { .. } => {
-            bail!("not implemented yet (step 6-8 of the plan)")
+        Command::Report => run_report(&cfg).await,
+        Command::Verify { .. } | Command::Restore { .. } => {
+            bail!("not implemented yet (step 8 of the plan)")
         }
-        Command::Cleanup { .. } => bail!("not implemented yet (step 6 of the plan)"),
+        Command::Cleanup { execute } => run_cleanup(&cfg, *execute).await,
     }
 }
 
@@ -164,7 +167,10 @@ async fn run_convert(cfg: &Config, args: &RunArgs) -> Result<()> {
     // Skips caused by this run's settings, rather than by the files themselves,
     // have to be reconsidered when those settings change. Otherwise turning on
     // --allow-video would silently do nothing to files it had already excluded.
-    let mut reopen: Vec<&str> = vec![SkipReason::TooLargeForBudget.as_str()];
+    let mut reopen: Vec<&str> = vec![
+        SkipReason::TooLargeForBudget.as_str(),
+        pipeline::OUT_OF_SCOPE,
+    ];
     if args.allow_video {
         reopen.push(SkipReason::VideoTierDisabled.as_str());
     }
@@ -217,6 +223,7 @@ async fn run_convert(cfg: &Config, args: &RunArgs) -> Result<()> {
             execute: args.execute,
             allow_video: args.allow_video,
             limit: args.limit,
+            scope: Scope::new(&cfg.paths, &cfg.exclude)?,
         })
         .await?;
 
@@ -241,11 +248,111 @@ async fn run_convert(cfg: &Config, args: &RunArgs) -> Result<()> {
     );
     println!("  skipped {}  failed {}", summary.skipped, summary.failed);
 
-    if args.execute && cfg.trash_policy == TrashPolicy::Keep {
+    if args.execute && trash::purges_after_run(cfg.trash_policy) {
+        println!("\nEmptying the trash as configured (trash_policy = purge_now)...");
+        run_cleanup(cfg, true).await?;
+    } else if args.execute && cfg.trash_policy == TrashPolicy::Keep {
         println!(
             "\n  Originals are in the trash, which still counts against your quota.\n  \
              Check the results, then run `cleanup --execute` to reclaim the space."
         );
+    }
+    Ok(())
+}
+
+/// Shows what the conversions achieved, keeping the three figures apart.
+async fn run_report(cfg: &Config) -> Result<()> {
+    let ledger = Ledger::open(&cfg.staging_dir.join("ledger.sqlite"))?;
+    let counts = ledger.counts().await?;
+    let savings = ledger.savings().await?;
+    let pending = ledger.pending_reclaim().await?;
+
+    // Quota is nice to have here, not essential; a report should still work when
+    // the remote is unreachable.
+    let remote_free = match RcdRemote::spawn(cfg.remote.clone(), None).await {
+        Ok(remote) => {
+            let free = remote.about().await.ok().and_then(|a| a.free);
+            let _ = remote.shutdown().await;
+            free
+        }
+        Err(e) => {
+            tracing::debug!("could not reach the remote for quota: {e:#}");
+            None
+        }
+    };
+
+    println!(
+        "Inventory: {} pending, {} done, {} skipped, {} failed",
+        counts.pending, counts.done, counts.skipped, counts.failed
+    );
+    println!("\nConverted {} file(s)", savings.files);
+    println!(
+        "  {:>12} in  ->  {:>12} out",
+        format_size(savings.original_bytes, DECIMAL),
+        format_size(savings.output_bytes, DECIMAL)
+    );
+    print!(
+        "{}",
+        trash::Accounting {
+            logical: savings.logical_bytes(),
+            pending,
+            remote_free,
+        }
+    );
+    if let Some(advice) = trash::advice(cfg.trash_policy, pending) {
+        println!("\n  {advice}");
+    }
+    Ok(())
+}
+
+/// Empties the trash, which is the step that actually shrinks the drive.
+async fn run_cleanup(cfg: &Config, execute: bool) -> Result<()> {
+    let ledger = Ledger::open(&cfg.staging_dir.join("ledger.sqlite"))?;
+    let pending = ledger.pending_reclaim().await?;
+
+    let remote = RcdRemote::spawn(cfg.remote.clone(), None).await?;
+    let before = remote.about().await.ok().and_then(|a| a.free);
+
+    if !execute {
+        println!(
+            "Would empty the trash, releasing {} held by {} replaced original(s).",
+            format_size(pending.bytes, DECIMAL),
+            pending.files
+        );
+        println!(
+            "\n  This is irreversible: once purged, the originals can no longer be \n  \
+             restored from the Filen web app. Re-run with --execute to proceed."
+        );
+        remote.shutdown().await?;
+        return Ok(());
+    }
+
+    remote.cleanup().await?;
+    let reclaimed = ledger.mark_reclaimed().await?;
+    let after = remote.about().await.ok().and_then(|a| a.free);
+    remote.shutdown().await?;
+
+    println!(
+        "Emptied the trash. {} of originals released.",
+        format_size(reclaimed, DECIMAL)
+    );
+    if let (Some(before), Some(after)) = (before, after) {
+        let gained = after.saturating_sub(before);
+        println!(
+            "  Remote free space: {} -> {} ({} recovered)",
+            format_size(before, DECIMAL),
+            format_size(after, DECIMAL),
+            format_size(gained, DECIMAL)
+        );
+        // A large discrepancy means something else is holding space: an older
+        // trash, file versions, or uploads this ledger does not know about.
+        if reclaimed > 0 && gained * 2 < reclaimed {
+            println!(
+                "\n  The drive freed noticeably less than the ledger expected. \n  \
+                 Other things may be occupying the trash, or old file versions may \n  \
+                 be retained separately."
+            );
+        }
     }
     Ok(())
 }

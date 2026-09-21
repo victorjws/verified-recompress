@@ -16,4 +16,6 @@ pub mod policy;
 pub mod preflight;
 pub mod remote;
 pub mod report;
+pub mod scope;
 pub mod staging;
+pub mod trash;

@@ -49,8 +49,20 @@ pub fn reservation_mib(recipe: Recipe, input_bytes: u64) -> u32 {
 /// A held slice of a budget. Dropping it returns the capacity.
 #[derive(Debug)]
 pub struct Lease {
-    _permit: OwnedSemaphorePermit,
+    permit: OwnedSemaphorePermit,
     pub mib: u32,
+}
+
+impl Lease {
+    /// Keeps the capacity spent after the lease goes out of scope.
+    ///
+    /// Uploaded bytes occupy the remote past the end of the job that wrote them:
+    /// the original it replaces sits in the trash, still billed, until the trash
+    /// is emptied. Holding the slice keeps the budget honest about that, and
+    /// [`Governor::release_cloud`] is what hands it back.
+    pub fn hold(self) {
+        self.permit.forget();
+    }
 }
 
 /// Cores granted to one encode, returned to the pool on drop.
@@ -160,7 +172,7 @@ impl Governor {
             .acquire_many_owned(mib.max(1))
             .await
             .expect("disk semaphore is never closed");
-        Ok(Lease { _permit: permit, mib })
+        Ok(Lease { permit, mib })
     }
 
     /// Reserves remote quota for an upload.
@@ -180,7 +192,7 @@ impl Governor {
             .acquire_many_owned(mib.max(1))
             .await
             .expect("cloud semaphore is never closed");
-        Ok(Lease { _permit: permit, mib })
+        Ok(Lease { permit, mib })
     }
 
     /// Returns quota to the budget after the trash has actually been emptied.

@@ -90,6 +90,7 @@ enum Cmd {
         reply: oneshot::Sender<Result<Vec<FileRow>>>,
     },
     ClaimNext {
+        prefixes: Vec<String>,
         reply: oneshot::Sender<Result<Option<FileRow>>>,
     },
     SetState {
@@ -105,6 +106,54 @@ enum Cmd {
         reasons: Vec<String>,
         reply: oneshot::Sender<Result<usize>>,
     },
+    RecordConversion {
+        record: Conversion,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    PendingReclaim {
+        reply: oneshot::Sender<Result<Reclaim>>,
+    },
+    MarkReclaimed {
+        reply: oneshot::Sender<Result<u64>>,
+    },
+    Savings {
+        reply: oneshot::Sender<Result<Savings>>,
+    },
+}
+
+/// A completed replacement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conversion {
+    pub path: String,
+    pub output_path: String,
+    pub output_size: u64,
+    pub recipe: String,
+    pub fidelity: String,
+}
+
+/// Originals sitting in the trash, still counted against the quota.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Reclaim {
+    pub files: u64,
+    pub bytes: u64,
+}
+
+/// What the conversions have achieved so far.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Savings {
+    pub files: u64,
+    pub original_bytes: u64,
+    pub output_bytes: u64,
+}
+
+impl Savings {
+    /// Bytes removed by the conversions themselves.
+    ///
+    /// This is not the same as the drop in quota: until the trash is emptied the
+    /// originals are still there, and the quota has in fact gone up.
+    pub fn logical_bytes(&self) -> u64 {
+        self.original_bytes.saturating_sub(self.output_bytes)
+    }
 }
 
 /// Handle to the ledger actor. Cloning it is cheap and safe across tasks.
@@ -173,10 +222,14 @@ impl Ledger {
         self.send(|reply| Cmd::ListByState { state, reply }).await
     }
 
-    /// Atomically takes the next pending file. Because the actor is the only writer,
-    /// two concurrent callers can never receive the same row.
-    pub async fn claim_next(&self) -> Result<Option<FileRow>> {
-        self.send(|reply| Cmd::ClaimNext { reply }).await
+    /// Atomically takes the next pending file within `prefixes`, largest first.
+    ///
+    /// The filter is applied here rather than after claiming, so a scoped run can
+    /// never pick up a file outside its scope even momentarily. An empty slice
+    /// means the whole remote.
+    pub async fn claim_next(&self, prefixes: &[String]) -> Result<Option<FileRow>> {
+        let prefixes = prefixes.to_vec();
+        self.send(|reply| Cmd::ClaimNext { prefixes, reply }).await
     }
 
     pub async fn set_state(
@@ -209,6 +262,27 @@ impl Ledger {
         let reasons = reasons.iter().map(|r| r.to_string()).collect();
         self.send(|reply| Cmd::ReopenSkipped { reasons, reply }).await
     }
+
+    /// Marks a file replaced, recording what replaced it and when the original
+    /// went to the trash.
+    pub async fn record_conversion(&self, record: Conversion) -> Result<()> {
+        self.send(|reply| Cmd::RecordConversion { record, reply })
+            .await
+    }
+
+    /// Originals still in the trash, whose space has not yet come back.
+    pub async fn pending_reclaim(&self) -> Result<Reclaim> {
+        self.send(|reply| Cmd::PendingReclaim { reply }).await
+    }
+
+    /// Records that the trash has been emptied. Returns the bytes reclaimed.
+    pub async fn mark_reclaimed(&self) -> Result<u64> {
+        self.send(|reply| Cmd::MarkReclaimed { reply }).await
+    }
+
+    pub async fn savings(&self) -> Result<Savings> {
+        self.send(|reply| Cmd::Savings { reply }).await
+    }
 }
 
 fn init_schema(conn: &Connection) -> Result<()> {
@@ -232,6 +306,38 @@ fn init_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS files_state_size ON files(state, size DESC);
         "#,
     )?;
+    migrate(conn)?;
+    Ok(())
+}
+
+/// Adds columns introduced after a ledger was first created.
+///
+/// Additive rather than a rebuild: the conversion history is the only record of
+/// what was replaced with what, and is not recoverable from a rescan.
+fn migrate(conn: &Connection) -> Result<()> {
+    let existing: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('files')")?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let wanted = [
+        // Where the replacement lives, and what it cost.
+        ("output_path", "TEXT"),
+        ("output_size", "INTEGER"),
+        ("recipe", "TEXT"),
+        // Which guarantee actually held: byte-exact or content-exact.
+        ("fidelity", "TEXT"),
+        // When the original was moved to the trash. Until the trash is emptied
+        // those bytes still count against the quota.
+        ("trashed_at", "TEXT"),
+        // Set once the space has genuinely been reclaimed.
+        ("reclaimed", "INTEGER NOT NULL DEFAULT 0"),
+    ];
+    for (name, decl) in wanted {
+        if !existing.iter().any(|c| c == name) {
+            conn.execute(&format!("ALTER TABLE files ADD COLUMN {name} {decl}"), [])?;
+        }
+    }
     Ok(())
 }
 
@@ -250,8 +356,8 @@ fn actor_loop(mut conn: Connection, mut rx: mpsc::Receiver<Cmd>) {
             Cmd::ListByState { state, reply } => {
                 let _ = reply.send(do_list_by_state(&conn, state));
             }
-            Cmd::ClaimNext { reply } => {
-                let _ = reply.send(do_claim_next(&mut conn));
+            Cmd::ClaimNext { prefixes, reply } => {
+                let _ = reply.send(do_claim_next(&mut conn, &prefixes));
             }
             Cmd::SetState {
                 path,
@@ -266,6 +372,18 @@ fn actor_loop(mut conn: Connection, mut rx: mpsc::Receiver<Cmd>) {
             }
             Cmd::ReopenSkipped { reasons, reply } => {
                 let _ = reply.send(do_reopen_skipped(&conn, &reasons));
+            }
+            Cmd::RecordConversion { record, reply } => {
+                let _ = reply.send(do_record_conversion(&conn, &record));
+            }
+            Cmd::PendingReclaim { reply } => {
+                let _ = reply.send(do_pending_reclaim(&conn));
+            }
+            Cmd::MarkReclaimed { reply } => {
+                let _ = reply.send(do_mark_reclaimed(&conn));
+            }
+            Cmd::Savings { reply } => {
+                let _ = reply.send(do_savings(&conn));
             }
         }
     }
@@ -388,13 +506,17 @@ fn do_list_by_state(conn: &Connection, state: State) -> Result<Vec<FileRow>> {
         .collect()
 }
 
-fn do_claim_next(conn: &mut Connection) -> Result<Option<FileRow>> {
+fn do_claim_next(conn: &mut Connection, prefixes: &[String]) -> Result<Option<FileRow>> {
     let tx = conn.transaction()?;
+    let (filter, params) = prefix_filter(prefixes);
+    let sql = format!(
+        "SELECT path, size, mod_time, blake3, state, skip_reason
+         FROM files WHERE state = 'pending'{filter} ORDER BY size DESC, path LIMIT 1"
+    );
     let raw = tx
         .query_row(
-            "SELECT path, size, mod_time, blake3, state, skip_reason
-             FROM files WHERE state = 'pending' ORDER BY size DESC, path LIMIT 1",
-            [],
+            &sql,
+            rusqlite::params_from_iter(params.iter()),
             row_to_file,
         )
         .optional()?;
@@ -410,6 +532,33 @@ fn do_claim_next(conn: &mut Connection) -> Result<Option<FileRow>> {
     let mut row = build_row(raw)?;
     row.state = State::Claimed;
     Ok(Some(row))
+}
+
+/// Builds a `path` restriction matching any of `prefixes`, plus its parameters.
+///
+/// Prefixes are matched with `LIKE 'prefix/%'` alongside an exact match, so a
+/// prefix lines up with a path segment and `Photos` cannot pick up
+/// `PhotosBackup`. LIKE wildcards inside a prefix are escaped, since folder names
+/// may legitimately contain `%` or `_`.
+fn prefix_filter(prefixes: &[String]) -> (String, Vec<String>) {
+    if prefixes.is_empty() {
+        return (String::new(), Vec::new());
+    }
+    let mut clauses = Vec::new();
+    let mut params = Vec::new();
+    for prefix in prefixes {
+        clauses.push("(path = ? OR path LIKE ? ESCAPE '\\')".to_string());
+        params.push(prefix.clone());
+        params.push(format!("{}/%", escape_like(prefix)));
+    }
+    (format!(" AND ({})", clauses.join(" OR ")), params)
+}
+
+fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 fn do_set_state(
@@ -451,6 +600,69 @@ fn do_reopen_skipped(conn: &Connection, reasons: &[String]) -> Result<usize> {
     );
     let params = rusqlite::params_from_iter(reasons.iter());
     Ok(conn.execute(&sql, params)?)
+}
+
+fn do_record_conversion(conn: &Connection, record: &Conversion) -> Result<()> {
+    let changed = conn.execute(
+        "UPDATE files SET
+            state       = 'done',
+            skip_reason = NULL,
+            output_path = ?2,
+            output_size = ?3,
+            recipe      = ?4,
+            fidelity    = ?5,
+            trashed_at  = datetime('now'),
+            reclaimed   = 0
+         WHERE path = ?1",
+        params![
+            record.path,
+            record.output_path,
+            record.output_size as i64,
+            record.recipe,
+            record.fidelity,
+        ],
+    )?;
+    if changed == 0 {
+        bail!("no ledger row for `{}`", record.path);
+    }
+    Ok(())
+}
+
+fn do_pending_reclaim(conn: &Connection) -> Result<Reclaim> {
+    let (files, bytes): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM files
+         WHERE state = 'done' AND trashed_at IS NOT NULL AND reclaimed = 0",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(Reclaim {
+        files: u64::try_from(files).unwrap_or(0),
+        bytes: u64::try_from(bytes).unwrap_or(0),
+    })
+}
+
+fn do_mark_reclaimed(conn: &Connection) -> Result<u64> {
+    let pending = do_pending_reclaim(conn)?;
+    conn.execute(
+        "UPDATE files SET reclaimed = 1
+         WHERE state = 'done' AND trashed_at IS NOT NULL AND reclaimed = 0",
+        [],
+    )?;
+    Ok(pending.bytes)
+}
+
+fn do_savings(conn: &Connection) -> Result<Savings> {
+    let (files, original, output): (i64, i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(size), 0), COALESCE(SUM(output_size), 0)
+         FROM files WHERE state = 'done' AND output_size IS NOT NULL",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    Ok(Savings {
+        files: u64::try_from(files).unwrap_or(0),
+        original_bytes: u64::try_from(original).unwrap_or(0),
+        output_bytes: u64::try_from(output).unwrap_or(0),
+    })
 }
 
 #[cfg(test)]
@@ -525,10 +737,10 @@ mod tests {
             .upsert(vec![entry("small", 1), entry("big", 100), entry("mid", 50)])
             .await
             .unwrap();
-        assert_eq!(ledger.claim_next().await.unwrap().unwrap().path, "big");
-        assert_eq!(ledger.claim_next().await.unwrap().unwrap().path, "mid");
-        assert_eq!(ledger.claim_next().await.unwrap().unwrap().path, "small");
-        assert!(ledger.claim_next().await.unwrap().is_none());
+        assert_eq!(ledger.claim_next(&[]).await.unwrap().unwrap().path, "big");
+        assert_eq!(ledger.claim_next(&[]).await.unwrap().unwrap().path, "mid");
+        assert_eq!(ledger.claim_next(&[]).await.unwrap().unwrap().path, "small");
+        assert!(ledger.claim_next(&[]).await.unwrap().is_none());
     }
 
     /// The whole point of the single-writer actor: concurrent claims cannot collide.
@@ -543,7 +755,7 @@ mod tests {
             let ledger = ledger.clone();
             handles.push(tokio::spawn(async move {
                 let mut mine = Vec::new();
-                while let Some(row) = ledger.claim_next().await.unwrap() {
+                while let Some(row) = ledger.claim_next(&[]).await.unwrap() {
                     mine.push(row.path);
                 }
                 mine
@@ -561,6 +773,85 @@ mod tests {
         assert_eq!(all.len(), 200, "every file should have been claimed exactly once");
     }
 
+    /// Scoping is a safety boundary: a run limited to one folder must not be able
+    /// to pick up a file in a sibling folder, even momentarily.
+    #[tokio::test]
+    async fn claims_are_confined_to_the_given_prefixes() {
+        let ledger = Ledger::open_in_memory().unwrap();
+        ledger
+            .upsert(vec![
+                entry("photos/a.jpg", 100),
+                entry("photos/2019/b.jpg", 90),
+                entry("audio/tone.wav", 80),
+                entry("videos/clip.mp4", 70),
+            ])
+            .await
+            .unwrap();
+
+        let scope = vec!["photos".to_string()];
+        let mut claimed = Vec::new();
+        while let Some(row) = ledger.claim_next(&scope).await.unwrap() {
+            claimed.push(row.path);
+        }
+        claimed.sort();
+        assert_eq!(claimed, vec!["photos/2019/b.jpg", "photos/a.jpg"]);
+
+        // Everything outside the scope is still available afterwards.
+        assert_eq!(ledger.counts().await.unwrap().pending, 2);
+    }
+
+    /// A prefix must align with a path segment, or `photos` would sweep up
+    /// `photos-backup` as well.
+    #[tokio::test]
+    async fn a_prefix_does_not_match_a_longer_sibling_directory() {
+        let ledger = Ledger::open_in_memory().unwrap();
+        ledger
+            .upsert(vec![entry("photos/a.jpg", 10), entry("photos-backup/b.jpg", 20)])
+            .await
+            .unwrap();
+        let scope = vec!["photos".to_string()];
+        assert_eq!(
+            ledger.claim_next(&scope).await.unwrap().unwrap().path,
+            "photos/a.jpg"
+        );
+        assert!(ledger.claim_next(&scope).await.unwrap().is_none());
+    }
+
+    /// Folder names may contain LIKE wildcards; they must be matched literally.
+    #[tokio::test]
+    async fn like_wildcards_in_a_folder_name_are_escaped() {
+        let ledger = Ledger::open_in_memory().unwrap();
+        ledger
+            .upsert(vec![entry("100%_done/a.jpg", 10), entry("100Xdone/b.jpg", 20)])
+            .await
+            .unwrap();
+        let scope = vec!["100%_done".to_string()];
+        assert_eq!(
+            ledger.claim_next(&scope).await.unwrap().unwrap().path,
+            "100%_done/a.jpg"
+        );
+        assert!(ledger.claim_next(&scope).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn several_prefixes_are_unioned_in_the_claim() {
+        let ledger = Ledger::open_in_memory().unwrap();
+        ledger
+            .upsert(vec![
+                entry("photos/a.jpg", 30),
+                entry("camera/b.jpg", 20),
+                entry("docs/c.pdf", 10),
+            ])
+            .await
+            .unwrap();
+        let scope = vec!["photos".to_string(), "camera".to_string()];
+        let mut claimed = Vec::new();
+        while let Some(row) = ledger.claim_next(&scope).await.unwrap() {
+            claimed.push(row.path);
+        }
+        assert_eq!(claimed, vec!["photos/a.jpg", "camera/b.jpg"]);
+    }
+
     #[tokio::test]
     async fn crashed_claims_are_recovered() {
         let ledger = Ledger::open_in_memory().unwrap();
@@ -568,7 +859,7 @@ mod tests {
             .upsert(vec![entry("a", 1), entry("b", 2)])
             .await
             .unwrap();
-        ledger.claim_next().await.unwrap();
+        ledger.claim_next(&[]).await.unwrap();
         assert_eq!(ledger.counts().await.unwrap().claimed, 1);
 
         assert_eq!(ledger.recover_claimed().await.unwrap(), 1);
@@ -670,6 +961,105 @@ mod tests {
         }
         let ledger = Ledger::open(&path).unwrap();
         assert_eq!(ledger.get("a.jpg").await.unwrap().unwrap().state, State::Done);
+    }
+
+    fn conversion(path: &str, output_size: u64) -> Conversion {
+        Conversion {
+            path: path.to_string(),
+            output_path: format!("{path}.jxl"),
+            output_size,
+            recipe: "jxl-from-jpeg".into(),
+            fidelity: "byte-exact".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn recording_a_conversion_marks_it_done_and_stores_the_result() {
+        let ledger = Ledger::open_in_memory().unwrap();
+        ledger.upsert(vec![entry("a.jpg", 1000)]).await.unwrap();
+        ledger.record_conversion(conversion("a.jpg", 800)).await.unwrap();
+
+        let row = ledger.get("a.jpg").await.unwrap().unwrap();
+        assert_eq!(row.state, State::Done);
+
+        let savings = ledger.savings().await.unwrap();
+        assert_eq!(savings.files, 1);
+        assert_eq!(savings.original_bytes, 1000);
+        assert_eq!(savings.output_bytes, 800);
+        assert_eq!(savings.logical_bytes(), 200);
+    }
+
+    /// The gap between "we converted things" and "the drive is smaller" is the
+    /// trash, and reporting has to be able to show it.
+    #[tokio::test]
+    async fn originals_stay_pending_reclaim_until_the_trash_is_emptied() {
+        let ledger = Ledger::open_in_memory().unwrap();
+        ledger
+            .upsert(vec![entry("a.jpg", 1000), entry("b.jpg", 500)])
+            .await
+            .unwrap();
+        ledger.record_conversion(conversion("a.jpg", 800)).await.unwrap();
+        ledger.record_conversion(conversion("b.jpg", 400)).await.unwrap();
+
+        let pending = ledger.pending_reclaim().await.unwrap();
+        assert_eq!(pending.files, 2);
+        // The originals' bytes, not the savings: that is what the trash holds.
+        assert_eq!(pending.bytes, 1500);
+
+        assert_eq!(ledger.mark_reclaimed().await.unwrap(), 1500);
+        assert_eq!(ledger.pending_reclaim().await.unwrap().bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn reclaiming_twice_does_not_double_count() {
+        let ledger = Ledger::open_in_memory().unwrap();
+        ledger.upsert(vec![entry("a.jpg", 1000)]).await.unwrap();
+        ledger.record_conversion(conversion("a.jpg", 800)).await.unwrap();
+        assert_eq!(ledger.mark_reclaimed().await.unwrap(), 1000);
+        assert_eq!(ledger.mark_reclaimed().await.unwrap(), 0);
+    }
+
+    /// Savings survive a reclaim; only the pending figure changes.
+    #[tokio::test]
+    async fn savings_persist_after_reclaiming() {
+        let ledger = Ledger::open_in_memory().unwrap();
+        ledger.upsert(vec![entry("a.jpg", 1000)]).await.unwrap();
+        ledger.record_conversion(conversion("a.jpg", 800)).await.unwrap();
+        ledger.mark_reclaimed().await.unwrap();
+        assert_eq!(ledger.savings().await.unwrap().logical_bytes(), 200);
+    }
+
+    #[tokio::test]
+    async fn recording_a_conversion_for_an_unknown_file_errors() {
+        let ledger = Ledger::open_in_memory().unwrap();
+        assert!(ledger.record_conversion(conversion("ghost", 1)).await.is_err());
+    }
+
+    /// A ledger written before the result columns existed must keep working.
+    #[tokio::test]
+    async fn an_older_ledger_is_migrated_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.sqlite");
+        {
+            // The original schema, without any of the result columns.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE files (
+                    path TEXT PRIMARY KEY, size INTEGER NOT NULL, mod_time TEXT,
+                    blake3 TEXT, state TEXT NOT NULL DEFAULT 'pending',
+                    skip_reason TEXT, seen_at TEXT NOT NULL DEFAULT (datetime('now')));
+                 INSERT INTO files (path, size) VALUES ('legacy.jpg', 4242);",
+            )
+            .unwrap();
+        }
+
+        let ledger = Ledger::open(&path).unwrap();
+        assert_eq!(ledger.get("legacy.jpg").await.unwrap().unwrap().size, 4242);
+        ledger
+            .record_conversion(conversion("legacy.jpg", 3000))
+            .await
+            .unwrap();
+        assert_eq!(ledger.savings().await.unwrap().logical_bytes(), 1242);
     }
 
     #[test]

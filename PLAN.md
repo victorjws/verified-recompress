@@ -10,7 +10,7 @@ Full design: `~/.claude/plans/filen-graceful-gadget.md`
 - [x] 3. 분류 + 정책 + `plan` — `classify.rs`, `policy.rs`, `report.rs` (133 tests green)
 - [x] 4. 이미지·오디오 변환 + 검증 — `convert/{mod,jxl,audio}.rs`, `hash.rs` (152 tests green)
 - [x] 5. 스테이징 + 동시성 파이프라인 — `governor.rs`, `staging.rs`, `pipeline.rs` (183 tests green)
-- [ ] 6. 쓰기 경로 + 휴지통 정책 + `cleanup`
+- [x] 6. 쓰기 경로 + 휴지통 정책 + `cleanup` + `report` + `scope.rs` (214 tests green)
 - [ ] 7. 영상 티어 — `vmaf.rs`, `convert/video_av1.rs`, `bench`
 - [ ] 8. dedup / restore
 - [ ] 9. 커밋
@@ -52,6 +52,11 @@ Full design: `~/.claude/plans/filen-graceful-gadget.md`
 - 설정 때문에 생긴 skip(`video_tier_disabled`, `too_large_for_budget`)은 영구 기록하면 안 된다.
   `--allow-video` 를 켜도 아무 일이 안 일어난다. run 시작 시 `reopen_skipped` 로 되돌린다.
 - dry-run 은 ledger 를 pending 으로 되돌려야 한다. 안 그러면 실제 실행이 건너뛴다.
+- **`--path` 스코프는 claim 쿼리에서 강제해야 한다.** scan 에만 적용하면 run 이 드라이브 전체를
+  건드린다 (실제로 `--path /photos` 가 audio/ 를 변환한 버그가 있었다). 접두사는 세그먼트
+  경계에 맞춰야 `photos` 가 `photos-backup` 을 삼키지 않는다. LIKE 와일드카드 이스케이프 필수.
+- 업로드 확인은 `operations/hashsumfile`(서버측 blake3) + stat 크기. 다운로드 없이 검증된다.
+- 클라우드 permit 은 job 종료 후에도 유지(`Lease::hold`). 휴지통 비우기 전까지 여전히 과금된다.
 
 ### Status
-5단계 완료. 6단계(쓰기 경로 + 휴지통 정책) 대기 중.
+6단계 완료. 7단계(영상 티어) 대기 중.

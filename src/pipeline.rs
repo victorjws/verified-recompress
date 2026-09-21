@@ -20,13 +20,18 @@ use tokio_util::sync::CancellationToken;
 use crate::classify;
 use crate::convert;
 use crate::governor::{self, Governor};
-use crate::ledger::{FileRow, Ledger, State};
+use crate::ledger::{Conversion, FileRow, Ledger, State};
 use crate::policy::{self, Decision, Facts, Limits, Recipe, SkipReason};
 use crate::remote::Remote;
+use crate::scope::Scope;
 use crate::staging::Workspace;
 
 /// How much of a file to read when confirming an ambiguous extension.
 const HEAD_BYTES: usize = 188 * 8;
+
+/// Recorded for files an exclude pattern kept out. Reopened on every run, since
+/// the patterns are configuration rather than a property of the file.
+pub const OUT_OF_SCOPE: &str = "out_of_scope";
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Summary {
@@ -68,6 +73,8 @@ pub struct Options {
     pub allow_video: bool,
     /// Stop after this many files.
     pub limit: Option<usize>,
+    /// Which files this run may touch.
+    pub scope: Scope,
 }
 
 pub struct Pipeline<R: Remote + 'static> {
@@ -117,9 +124,19 @@ impl<R: Remote + 'static> Pipeline<R> {
                 break;
             }
 
-            let Some(row) = self.ledger.claim_next().await? else {
+            let Some(row) = self.ledger.claim_next(opts.scope.prefixes()).await? else {
                 break;
             };
+
+            // Prefixes are enforced in the query; the glob excludes are checked
+            // here, where a compiled GlobSet is available.
+            if opts.scope.is_excluded(&row.path) {
+                self.ledger
+                    .set_state(&row.path, State::Skipped, Some(OUT_OF_SCOPE.to_string()))
+                    .await?;
+                summary.skipped += 1;
+                continue;
+            }
             started += 1;
 
             let this = Arc::clone(&self);
@@ -251,7 +268,100 @@ impl<R: Remote + 'static> Pipeline<R> {
             });
         }
 
-        bail!("the write path is not wired up yet (step 6 of the plan)")
+        let remote_output = swap_extension(&row.path, recipe.output_extension(extension_of(&row.path)));
+
+        // Refuse to write over something that is already there. Same-extension
+        // recipes aside, a collision means an unrelated file, or the leftovers of
+        // an interrupted earlier attempt that has not been accounted for.
+        if remote_output != row.path {
+            let _api = self.governor.api().await;
+            if self.remote.stat(&remote_output).await?.is_some() {
+                bail!("{remote_output} already exists; refusing to overwrite it");
+            }
+        }
+
+        // Hold remote quota for the upload. It is only released once the trash has
+        // actually been emptied, because until then the original is still billed.
+        let cloud_mib = governor::bytes_to_mib(output_bytes);
+        let cloud = self.governor.cloud(cloud_mib).await?;
+
+        let local_hash = crate::hash::blake3_file(&output).await?;
+        {
+            let _net = self.governor.network().await;
+            self.remote.upload(&output, &remote_output).await?;
+        }
+
+        // Confirm what landed before touching the original. `hashsum` is answered
+        // server-side, so this costs no download.
+        {
+            let _api = self.governor.api().await;
+            self.confirm_upload(&remote_output, output_bytes, &local_hash)
+                .await?;
+        }
+
+        // Only now is it safe. The original goes to the trash, where it stays
+        // recoverable until `cleanup` runs.
+        {
+            let _api = self.governor.api().await;
+            self.remote.delete(&row.path).await?;
+        }
+
+        self.ledger
+            .record_conversion(Conversion {
+                path: row.path.clone(),
+                output_path: remote_output.clone(),
+                output_size: output_bytes,
+                recipe: recipe.as_str().to_string(),
+                fidelity: fidelity.as_str().to_string(),
+            })
+            .await?;
+
+        // The quota stays spent past the end of this job: the original is in the
+        // trash and still billed until `cleanup` empties it.
+        cloud.hold();
+
+        tracing::info!(
+            "{} -> {} ({} -> {} bytes, {})",
+            row.path,
+            remote_output,
+            row.size,
+            output_bytes,
+            fidelity.as_str()
+        );
+        Ok(Outcome::Converted {
+            input: row.size,
+            output: output_bytes,
+        })
+    }
+
+    /// Checks the uploaded object is the file we meant to upload.
+    ///
+    /// A size match alone would not catch a truncated or corrupted transfer, so the
+    /// hash is compared too whenever the backend can produce one. Filen reports
+    /// blake3; a backend that reports nothing leaves only the size check, and that
+    /// is stated rather than passed off as a full verification.
+    async fn confirm_upload(&self, path: &str, expected_size: u64, expected_hash: &str) -> Result<()> {
+        let Some(entry) = self.remote.stat(path).await? else {
+            bail!("{path} is missing after upload");
+        };
+        if entry.size != expected_size {
+            bail!(
+                "{path} is {} bytes on the remote, expected {expected_size}",
+                entry.size
+            );
+        }
+        match self.remote.hashsum(path).await? {
+            Some(remote_hash) if remote_hash.eq_ignore_ascii_case(expected_hash) => Ok(()),
+            Some(remote_hash) => bail!(
+                "{path} hashes to {remote_hash} on the remote but {expected_hash} locally"
+            ),
+            None => {
+                tracing::warn!(
+                    "{path}: the remote reports no hash, so only the size was confirmed"
+                );
+                Ok(())
+            }
+        }
     }
 
     async fn record_skip(&self, path: &str, reason: SkipReason) -> Result<Outcome> {
@@ -284,6 +394,28 @@ fn extension_of(path: &str) -> &str {
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
+}
+
+/// Replaces a path's extension, keeping everything else exactly as it was.
+///
+/// Operates on the string rather than `Path::set_extension` so that directory
+/// separators stay `/` regardless of the host platform: these are remote paths,
+/// not local ones.
+fn swap_extension(path: &str, new_extension: &str) -> String {
+    let (dir, name) = match path.rsplit_once('/') {
+        Some((dir, name)) => (Some(dir), name),
+        None => (None, path),
+    };
+    // A leading dot is part of the name, not an extension separator.
+    let stem = match name.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() => stem,
+        _ => name,
+    };
+    let renamed = format!("{stem}.{new_extension}");
+    match dir {
+        Some(dir) => format!("{dir}/{renamed}"),
+        None => renamed,
+    }
 }
 
 /// Reads the first few KiB, for confirming extensions that lie.
@@ -330,6 +462,32 @@ mod tests {
     fn extracts_extensions() {
         assert_eq!(extension_of("a/b/c.JPG"), "JPG");
         assert_eq!(extension_of("noext"), "");
+    }
+
+    #[test]
+    fn swaps_extensions_without_disturbing_the_path() {
+        assert_eq!(swap_extension("photos/shot.jpg", "jxl"), "photos/shot.jxl");
+        assert_eq!(swap_extension("shot.JPEG", "jxl"), "shot.jxl");
+        assert_eq!(swap_extension("noext", "jxl"), "noext.jxl");
+    }
+
+    /// Names with dots in them, and dotfiles, must survive intact.
+    #[test]
+    fn swapping_handles_awkward_names() {
+        assert_eq!(
+            swap_extension("a/my.holiday.2019.jpg", "jxl"),
+            "a/my.holiday.2019.jxl"
+        );
+        // A leading dot is part of the name, not an extension marker.
+        assert_eq!(swap_extension(".hidden", "jxl"), ".hidden.jxl");
+        assert_eq!(swap_extension("dir.with.dots/x.png", "jxl"), "dir.with.dots/x.jxl");
+    }
+
+    /// A recipe that keeps the container produces the same path, which the write
+    /// path relies on to know it is not clobbering an unrelated file.
+    #[test]
+    fn a_same_extension_recipe_leaves_the_path_unchanged() {
+        assert_eq!(swap_extension("clip.mp4", "mp4"), "clip.mp4");
     }
 
     #[test]
