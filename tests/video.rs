@@ -8,12 +8,12 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use storage_optimizer::classify;
-use storage_optimizer::convert::{self, Fidelity, VideoOptions};
-use storage_optimizer::convert::video_av1;
-use storage_optimizer::convert::video_lossless::{self, StreamDigest};
-use storage_optimizer::policy::Recipe;
-use storage_optimizer::vmaf;
+use verified_recompress::classify;
+use verified_recompress::convert::{self, Fidelity, VideoOptions};
+use verified_recompress::convert::video_av1;
+use verified_recompress::convert::video_lossless::{self, StreamDigest};
+use verified_recompress::policy::Recipe;
+use verified_recompress::vmaf;
 
 fn have(tool: &str, flag: &str) -> bool {
     Command::new(tool)

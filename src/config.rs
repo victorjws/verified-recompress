@@ -62,9 +62,9 @@ pub struct FileConfig {
 }
 
 impl FileConfig {
-    /// Default location: `~/.config/storage-optimizer/config.toml`.
+    /// Default location: `~/.config/verified-recompress/config.toml`.
     pub fn default_path() -> Option<PathBuf> {
-        dirs::config_dir().map(|d| d.join("storage-optimizer").join("config.toml"))
+        dirs::config_dir().map(|d| d.join("verified-recompress").join("config.toml"))
     }
 
     /// Loads the file at `path`. A missing file yields defaults; a malformed one errors.
@@ -270,7 +270,7 @@ impl Config {
 }
 
 fn default_staging_dir() -> PathBuf {
-    std::env::temp_dir().join("storage-optimizer")
+    std::env::temp_dir().join("verified-recompress")
 }
 
 /// Free space on the filesystem holding `dir`, walking up to the nearest existing

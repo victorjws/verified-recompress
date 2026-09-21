@@ -8,8 +8,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use storage_optimizer::convert::{self, Fidelity};
-use storage_optimizer::policy::Recipe;
+use verified_recompress::convert::{self, Fidelity};
+use verified_recompress::policy::Recipe;
 
 fn have(tool: &str, version_flag: &str) -> bool {
     Command::new(tool)

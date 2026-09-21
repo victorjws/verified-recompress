@@ -7,22 +7,22 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
-use storage_optimizer::cli::{Cli, Command, RunArgs};
-use storage_optimizer::config::{self, Config, FileConfig, TrashPolicy};
-use storage_optimizer::bench;
-use storage_optimizer::convert;
-use storage_optimizer::governor::Governor;
-use storage_optimizer::ledger::{Ledger, State};
-use storage_optimizer::pipeline::{self, Pipeline};
-use storage_optimizer::policy::{self, Limits, SkipReason};
-use storage_optimizer::preflight;
-use storage_optimizer::remote::{Remote, rcd::RcdRemote};
-use storage_optimizer::dedup;
-use storage_optimizer::report::Projection;
-use storage_optimizer::restore;
-use storage_optimizer::scope::Scope;
-use storage_optimizer::staging;
-use storage_optimizer::trash;
+use verified_recompress::cli::{Cli, Command, RunArgs};
+use verified_recompress::config::{self, Config, FileConfig, TrashPolicy};
+use verified_recompress::bench;
+use verified_recompress::convert;
+use verified_recompress::governor::Governor;
+use verified_recompress::ledger::{Ledger, State};
+use verified_recompress::pipeline::{self, Pipeline};
+use verified_recompress::policy::{self, Limits, SkipReason};
+use verified_recompress::preflight;
+use verified_recompress::remote::{Remote, rcd::RcdRemote};
+use verified_recompress::dedup;
+use verified_recompress::report::Projection;
+use verified_recompress::restore;
+use verified_recompress::scope::Scope;
+use verified_recompress::staging;
+use verified_recompress::trash;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -40,7 +40,7 @@ async fn main() -> Result<()> {
         .overrides()
         .staging_dir
         .or_else(|| file.staging_dir.clone())
-        .unwrap_or_else(|| std::env::temp_dir().join("storage-optimizer"));
+        .unwrap_or_else(|| std::env::temp_dir().join("verified-recompress"));
     let available = config::available_space(&staging_dir)?;
 
     let cfg = Config::resolve(file, cli.overrides(), available)?;
@@ -378,7 +378,7 @@ async fn run_bench(cfg: &Config, sample: usize) -> Result<()> {
         .await?
         .into_iter()
         .filter(|row| scope.allows(&row.path))
-        .filter(|row| storage_optimizer::classify::kind_from_extension(&row.path).is_video())
+        .filter(|row| verified_recompress::classify::kind_from_extension(&row.path).is_video())
         .take(sample)
         .collect();
 
@@ -488,7 +488,7 @@ async fn run_verify(cfg: &Config, sample: Option<usize>) -> Result<()> {
 /// Returns whether the original was actually rebuilt, as opposed to merely found.
 async fn verify_one(
     remote: &RcdRemote,
-    record: &storage_optimizer::ledger::Completed,
+    record: &verified_recompress::ledger::Completed,
     work: &std::path::Path,
 ) -> Result<bool> {
     let Some(entry) = remote.stat(&record.output_path).await? else {
@@ -574,9 +574,9 @@ async fn run_preflight(cfg: &Config) -> Result<()> {
 
 fn init_tracing(verbose: u8) {
     let default = match verbose {
-        0 => "storage_optimizer=info",
-        1 => "storage_optimizer=debug",
-        _ => "storage_optimizer=trace",
+        0 => "verified_recompress=info",
+        1 => "verified_recompress=debug",
+        _ => "verified_recompress=trace",
     };
     tracing_subscriber::fmt()
         .with_env_filter(

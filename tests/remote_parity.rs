@@ -11,10 +11,10 @@
 use std::path::Path;
 use std::process::Command;
 
-use storage_optimizer::ledger::{Ledger, State};
-use storage_optimizer::remote::rclone_cli::CliRemote;
-use storage_optimizer::remote::rcd::RcdRemote;
-use storage_optimizer::remote::{Entry, Remote};
+use verified_recompress::ledger::{Ledger, State};
+use verified_recompress::remote::rclone_cli::CliRemote;
+use verified_recompress::remote::rcd::RcdRemote;
+use verified_recompress::remote::{Entry, Remote};
 
 /// Skips the test (rather than failing) when rclone is absent, so `cargo test`
 /// still works on a machine that has not been set up yet.

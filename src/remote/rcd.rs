@@ -28,7 +28,7 @@ use super::{About, Entry, HASH_TYPE, Remote, parse_about, parse_entries, remote_
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 /// Grace period for a polite `core/quit` before the child is killed.
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(1500);
-const RC_USER: &str = "storage-optimizer";
+const RC_USER: &str = "verified-recompress";
 
 pub struct RcdRemote {
     remote: String,

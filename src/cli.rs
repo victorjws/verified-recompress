@@ -8,12 +8,12 @@ use crate::config::{Order, Overrides, TrashPolicy};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "storage-optimizer",
+    name = "verified-recompress",
     version,
     about = "Re-encode Filen cloud files to more efficient formats without losing data"
 )]
 pub struct Cli {
-    /// Config file path (default: ~/.config/storage-optimizer/config.toml).
+    /// Config file path (default: ~/.config/verified-recompress/config.toml).
     #[arg(long, global = true, value_name = "FILE")]
     pub config: Option<PathBuf>,
 
@@ -205,7 +205,7 @@ mod tests {
     #[test]
     fn run_flags_become_overrides() {
         let cli = Cli::try_parse_from([
-            "storage-optimizer",
+            "verified-recompress",
             "--remote",
             "test:",
             "--path",
@@ -227,7 +227,7 @@ mod tests {
     #[test]
     fn repeated_path_and_exclude_accumulate() {
         let cli = Cli::try_parse_from([
-            "storage-optimizer",
+            "verified-recompress",
             "--path",
             "/A",
             "--path",
@@ -249,7 +249,7 @@ mod tests {
     /// Run-only flags must not leak into other subcommands' overrides.
     #[test]
     fn non_run_subcommand_has_no_run_overrides() {
-        let cli = Cli::try_parse_from(["storage-optimizer", "scan"]).unwrap();
+        let cli = Cli::try_parse_from(["verified-recompress", "scan"]).unwrap();
         let ov = cli.overrides();
         assert_eq!(ov.staging_budget_gb, None);
         assert_eq!(ov.trash_policy, None);

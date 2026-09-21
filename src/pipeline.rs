@@ -299,7 +299,7 @@ impl<R: Remote + 'static> Pipeline<R> {
         // invariant that nothing is removed before its replacement exists.
         let replaces_in_place = remote_output == row.path;
         let upload_target = if replaces_in_place {
-            format!("{}.storage-optimizer-{job_id}.part", row.path)
+            format!("{}.verified-recompress-{job_id}.part", row.path)
         } else {
             remote_output.clone()
         };
@@ -553,7 +553,7 @@ mod tests {
     #[test]
     fn the_in_place_staging_name_is_distinct_and_self_describing() {
         let path = "videos/clip.mp4";
-        let staged = format!("{path}.storage-optimizer-{}.part", 7u64);
+        let staged = format!("{path}.verified-recompress-{}.part", 7u64);
         assert_ne!(staged, path);
         assert!(staged.starts_with(path));
         assert!(staged.ends_with(".part"));
