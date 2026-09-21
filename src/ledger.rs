@@ -101,6 +101,10 @@ enum Cmd {
     RecoverClaimed {
         reply: oneshot::Sender<Result<usize>>,
     },
+    ReopenSkipped {
+        reasons: Vec<String>,
+        reply: oneshot::Sender<Result<usize>>,
+    },
 }
 
 /// Handle to the ledger actor. Cloning it is cheap and safe across tasks.
@@ -195,6 +199,16 @@ impl Ledger {
     pub async fn recover_claimed(&self) -> Result<usize> {
         self.send(|reply| Cmd::RecoverClaimed { reply }).await
     }
+
+    /// Returns files skipped for the given reasons to `pending`.
+    ///
+    /// Used when a setting changes that could alter the verdict, so that enabling
+    /// the video tier or raising the size cap actually reconsiders the files those
+    /// limits excluded, instead of leaving them skipped forever.
+    pub async fn reopen_skipped(&self, reasons: &[&str]) -> Result<usize> {
+        let reasons = reasons.iter().map(|r| r.to_string()).collect();
+        self.send(|reply| Cmd::ReopenSkipped { reasons, reply }).await
+    }
 }
 
 fn init_schema(conn: &Connection) -> Result<()> {
@@ -249,6 +263,9 @@ fn actor_loop(mut conn: Connection, mut rx: mpsc::Receiver<Cmd>) {
             }
             Cmd::RecoverClaimed { reply } => {
                 let _ = reply.send(do_recover_claimed(&conn));
+            }
+            Cmd::ReopenSkipped { reasons, reply } => {
+                let _ = reply.send(do_reopen_skipped(&conn, &reasons));
             }
         }
     }
@@ -419,6 +436,23 @@ fn do_recover_claimed(conn: &Connection) -> Result<usize> {
     Ok(n)
 }
 
+fn do_reopen_skipped(conn: &Connection, reasons: &[String]) -> Result<usize> {
+    if reasons.is_empty() {
+        return Ok(0);
+    }
+    // rusqlite has no list binding, so build one placeholder per reason rather
+    // than interpolating values into the statement.
+    let placeholders = std::iter::repeat_n("?", reasons.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "UPDATE files SET state = 'pending', skip_reason = NULL
+         WHERE state = 'skipped' AND skip_reason IN ({placeholders})"
+    );
+    let params = rusqlite::params_from_iter(reasons.iter());
+    Ok(conn.execute(&sql, params)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,6 +575,62 @@ mod tests {
         let counts = ledger.counts().await.unwrap();
         assert_eq!(counts.claimed, 0);
         assert_eq!(counts.pending, 2);
+    }
+
+    /// Enabling the video tier must reconsider the files that were skipped only
+    /// because it was off, while leaving genuinely unsuitable files alone.
+    #[tokio::test]
+    async fn settings_dependent_skips_can_be_reopened() {
+        let ledger = Ledger::open_in_memory().unwrap();
+        ledger
+            .upsert(vec![entry("gated", 1), entry("hdr", 2), entry("big", 3)])
+            .await
+            .unwrap();
+        ledger
+            .set_state("gated", State::Skipped, Some("video_tier_disabled".into()))
+            .await
+            .unwrap();
+        ledger
+            .set_state("hdr", State::Skipped, Some("video_hdr".into()))
+            .await
+            .unwrap();
+        ledger
+            .set_state("big", State::Skipped, Some("too_large_for_budget".into()))
+            .await
+            .unwrap();
+
+        let reopened = ledger
+            .reopen_skipped(&["video_tier_disabled", "too_large_for_budget"])
+            .await
+            .unwrap();
+        assert_eq!(reopened, 2);
+
+        assert_eq!(ledger.get("gated").await.unwrap().unwrap().state, State::Pending);
+        assert_eq!(ledger.get("big").await.unwrap().unwrap().state, State::Pending);
+        // An HDR file is unsuitable no matter how the run is configured.
+        assert_eq!(ledger.get("hdr").await.unwrap().unwrap().state, State::Skipped);
+    }
+
+    #[tokio::test]
+    async fn reopening_clears_the_stale_reason() {
+        let ledger = Ledger::open_in_memory().unwrap();
+        ledger.upsert(vec![entry("a", 1)]).await.unwrap();
+        ledger
+            .set_state("a", State::Skipped, Some("video_tier_disabled".into()))
+            .await
+            .unwrap();
+        ledger.reopen_skipped(&["video_tier_disabled"]).await.unwrap();
+        assert_eq!(ledger.get("a").await.unwrap().unwrap().skip_reason, None);
+    }
+
+    #[tokio::test]
+    async fn reopening_nothing_is_harmless() {
+        let ledger = Ledger::open_in_memory().unwrap();
+        ledger.upsert(vec![entry("a", 1)]).await.unwrap();
+        ledger.set_state("a", State::Done, None).await.unwrap();
+        assert_eq!(ledger.reopen_skipped(&[]).await.unwrap(), 0);
+        assert_eq!(ledger.reopen_skipped(&["video_hdr"]).await.unwrap(), 0);
+        assert_eq!(ledger.get("a").await.unwrap().unwrap().state, State::Done);
     }
 
     #[tokio::test]

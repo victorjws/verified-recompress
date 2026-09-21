@@ -9,7 +9,7 @@ Full design: `~/.claude/plans/filen-graceful-gadget.md`
 - [x] 2. Remote + 인벤토리 — `remote/{mod,rcd,rclone_cli}.rs`, `ledger.rs`, `scan` (81 tests green)
 - [x] 3. 분류 + 정책 + `plan` — `classify.rs`, `policy.rs`, `report.rs` (133 tests green)
 - [x] 4. 이미지·오디오 변환 + 검증 — `convert/{mod,jxl,audio}.rs`, `hash.rs` (152 tests green)
-- [ ] 5. 스테이징 + `run` 파이프라인 (dry-run)
+- [x] 5. 스테이징 + 동시성 파이프라인 — `governor.rs`, `staging.rs`, `pipeline.rs` (183 tests green)
 - [ ] 6. 쓰기 경로 + 휴지통 정책 + `cleanup`
 - [ ] 7. 영상 티어 — `vmaf.rs`, `convert/video_av1.rs`, `bench`
 - [ ] 8. dedup / restore
@@ -47,6 +47,11 @@ Full design: `~/.claude/plans/filen-graceful-gadget.md`
 - ffmpeg 에 JPEG XL 디코더가 없는 빌드가 흔하다. `.jxl` 검증은 `djxl` 로 디코딩한 뒤 해시.
 - `flac --keep-foreign-metadata` 로 WAV→FLAC 도 바이트 복원 가능 (비용 0.3%). 기본으로 쓸 것.
 - `sha2` 0.11 은 해셔에 `io::Write` 를 구현하지 않는다. 청크로 직접 읽어 update.
+- 스테이지 큐를 만들지 않았다. 파일당 태스크 + 자원별 세마포어로 같은 중첩이 나온다.
+  코어를 기다리는 작업이 네트워크 슬롯을 쥐고 있지 않은 것이 핵심.
+- 설정 때문에 생긴 skip(`video_tier_disabled`, `too_large_for_budget`)은 영구 기록하면 안 된다.
+  `--allow-video` 를 켜도 아무 일이 안 일어난다. run 시작 시 `reopen_skipped` 로 되돌린다.
+- dry-run 은 ledger 를 pending 으로 되돌려야 한다. 안 그러면 실제 실행이 건너뛴다.
 
 ### Status
-4단계 완료. 5단계(스테이징 + 동시성 파이프라인) 대기 중.
+5단계 완료. 6단계(쓰기 경로 + 휴지통 정책) 대기 중.

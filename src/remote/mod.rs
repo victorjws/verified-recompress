@@ -15,6 +15,7 @@ pub mod rcd;
 
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -48,6 +49,22 @@ pub trait Remote: Send + Sync {
     /// Recursively lists files under `scope`, a path relative to the remote root.
     /// Returned paths are also relative to the remote root, not to `scope`.
     fn list(&self, scope: &str) -> impl Future<Output = Result<Vec<Entry>>> + Send;
+
+    /// Fetches one file to a local path.
+    fn download(&self, path: &str, local: &Path) -> impl Future<Output = Result<()>> + Send;
+
+    /// Stores a local file at `path`, replacing whatever is there.
+    fn upload(&self, local: &Path, path: &str) -> impl Future<Output = Result<()>> + Send;
+
+    /// Removes one file. On Filen this moves it to the trash, which still counts
+    /// against the quota until [`Remote::cleanup`] runs.
+    fn delete(&self, path: &str) -> impl Future<Output = Result<()>> + Send;
+
+    /// Renames within the remote. Server-side, so it costs no transfer.
+    fn move_to(&self, from: &str, to: &str) -> impl Future<Output = Result<()>> + Send;
+
+    /// Empties the trash, which is what actually reclaims quota.
+    fn cleanup(&self) -> impl Future<Output = Result<()>> + Send;
 
     /// Quota for the remote. Free space here gates uploads.
     fn about(&self) -> impl Future<Output = Result<About>> + Send;

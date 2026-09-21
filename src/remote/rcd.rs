@@ -11,6 +11,7 @@
 //! `--rc-no-auth` is never used.
 
 use std::future::Future;
+use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -199,6 +200,81 @@ impl Remote for RcdRemote {
         }
     }
 
+    fn download(&self, path: &str, local: &Path) -> impl Future<Output = Result<()>> + Send {
+        let fs = remote_spec(&self.remote, "");
+        let remote_path = super::normalize_path(path);
+        let split = split_local(local);
+        async move {
+            let (dir, name) = split?;
+            self.call(
+                "operations/copyfile",
+                json!({
+                    "srcFs": fs, "srcRemote": remote_path,
+                    "dstFs": dir, "dstRemote": name,
+                }),
+            )
+            .await
+            .map(|_| ())
+        }
+    }
+
+    fn upload(&self, local: &Path, path: &str) -> impl Future<Output = Result<()>> + Send {
+        let fs = remote_spec(&self.remote, "");
+        let remote_path = super::normalize_path(path);
+        let split = split_local(local);
+        async move {
+            let (dir, name) = split?;
+            self.call(
+                "operations/copyfile",
+                json!({
+                    "srcFs": dir, "srcRemote": name,
+                    "dstFs": fs, "dstRemote": remote_path,
+                }),
+            )
+            .await
+            .map(|_| ())
+        }
+    }
+
+    fn delete(&self, path: &str) -> impl Future<Output = Result<()>> + Send {
+        let fs = remote_spec(&self.remote, "");
+        let remote_path = super::normalize_path(path);
+        async move {
+            self.call(
+                "operations/deletefile",
+                json!({ "fs": fs, "remote": remote_path }),
+            )
+            .await
+            .map(|_| ())
+        }
+    }
+
+    fn move_to(&self, from: &str, to: &str) -> impl Future<Output = Result<()>> + Send {
+        let fs = remote_spec(&self.remote, "");
+        let from = super::normalize_path(from);
+        let to = super::normalize_path(to);
+        async move {
+            self.call(
+                "operations/movefile",
+                json!({
+                    "srcFs": fs, "srcRemote": from,
+                    "dstFs": fs, "dstRemote": to,
+                }),
+            )
+            .await
+            .map(|_| ())
+        }
+    }
+
+    fn cleanup(&self) -> impl Future<Output = Result<()>> + Send {
+        let fs = remote_spec(&self.remote, "");
+        async move {
+            self.call("operations/cleanup", json!({ "fs": fs }))
+                .await
+                .map(|_| ())
+        }
+    }
+
     fn about(&self) -> impl Future<Output = Result<About>> + Send {
         let fs = remote_spec(&self.remote, "");
         async move {
@@ -252,6 +328,24 @@ impl Remote for RcdRemote {
             Ok(response.hash.filter(|h| !h.is_empty()))
         }
     }
+}
+
+/// Splits a local file path into the (directory, filename) pair the rc API wants.
+///
+/// `operations/copyfile` addresses both ends as a filesystem plus a name within it;
+/// a bare local directory path is a valid filesystem, so no remote name is needed.
+fn split_local(path: &Path) -> Result<(String, String)> {
+    let dir = path
+        .parent()
+        .context("local path has no parent directory")?
+        .to_string_lossy()
+        .into_owned();
+    let name = path
+        .file_name()
+        .context("local path has no file name")?
+        .to_string_lossy()
+        .into_owned();
+    Ok((dir, name))
 }
 
 /// Binds port 0 to let the OS pick a free port, then releases it.

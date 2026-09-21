@@ -6,7 +6,7 @@ license = "AGPL-3.0-only"
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "process", "fs", "sync", "signal", "time"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "process", "fs", "sync", "signal", "time", "io-util"] }
 tokio-util = { version = "0.7.19", features = ["rt"] }
 futures = "0.3.34"
 reqwest = { version = "0.13.5", features = ["json"], default-features = false }

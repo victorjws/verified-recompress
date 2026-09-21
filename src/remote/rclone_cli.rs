@@ -4,6 +4,7 @@
 //! use it as the reference behaviour that [`super::rcd::RcdRemote`] must match.
 
 use std::future::Future;
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use tokio::process::Command;
@@ -102,6 +103,38 @@ impl Remote for CliRemote {
                 .await?;
             parse_entries(&json, &scope)
         }
+    }
+
+    fn download(&self, path: &str, local: &Path) -> impl Future<Output = Result<()>> + Send {
+        let spec = remote_spec(&self.remote, path);
+        let local = local.to_string_lossy().into_owned();
+        async move {
+            // `copyto` is file-to-file, unlike `copy`, which would treat the
+            // destination as a directory.
+            self.run(&["copyto", &spec, &local]).await.map(|_| ())
+        }
+    }
+
+    fn upload(&self, local: &Path, path: &str) -> impl Future<Output = Result<()>> + Send {
+        let spec = remote_spec(&self.remote, path);
+        let local = local.to_string_lossy().into_owned();
+        async move { self.run(&["copyto", &local, &spec]).await.map(|_| ()) }
+    }
+
+    fn delete(&self, path: &str) -> impl Future<Output = Result<()>> + Send {
+        let spec = remote_spec(&self.remote, path);
+        async move { self.run(&["deletefile", &spec]).await.map(|_| ()) }
+    }
+
+    fn move_to(&self, from: &str, to: &str) -> impl Future<Output = Result<()>> + Send {
+        let from = remote_spec(&self.remote, from);
+        let to = remote_spec(&self.remote, to);
+        async move { self.run(&["moveto", &from, &to]).await.map(|_| ()) }
+    }
+
+    fn cleanup(&self) -> impl Future<Output = Result<()>> + Send {
+        let spec = self.remote.clone();
+        async move { self.run(&["cleanup", &spec]).await.map(|_| ()) }
     }
 
     fn about(&self) -> impl Future<Output = Result<About>> + Send {

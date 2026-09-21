@@ -125,6 +125,19 @@ pub enum SkipReason {
 }
 
 impl SkipReason {
+    /// Whether this verdict depends on how the run was configured rather than on
+    /// the file itself.
+    ///
+    /// A file left alone because `--allow-video` was absent, or because the staging
+    /// budget was small, must be reconsidered when those change. A file left alone
+    /// because it is HDR or already AV1 never needs looking at again.
+    pub fn depends_on_settings(self) -> bool {
+        matches!(
+            self,
+            SkipReason::VideoTierDisabled | SkipReason::TooLargeForBudget
+        )
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             SkipReason::AlreadyOptimal => "already_optimal",
