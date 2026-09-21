@@ -7,6 +7,8 @@
 pub mod classify;
 pub mod cli;
 pub mod config;
+pub mod convert;
+pub mod hash;
 pub mod ledger;
 pub mod policy;
 pub mod preflight;

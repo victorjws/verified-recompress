@@ -8,7 +8,7 @@ Full design: `~/.claude/plans/filen-graceful-gadget.md`
 - [x] 1. 스켈레톤 — Cargo.toml, `cli.rs`, `config.rs`, `preflight.rs` (44 tests green)
 - [x] 2. Remote + 인벤토리 — `remote/{mod,rcd,rclone_cli}.rs`, `ledger.rs`, `scan` (81 tests green)
 - [x] 3. 분류 + 정책 + `plan` — `classify.rs`, `policy.rs`, `report.rs` (133 tests green)
-- [ ] 4. 이미지·오디오 변환 + 검증 (로컬)
+- [x] 4. 이미지·오디오 변환 + 검증 — `convert/{mod,jxl,audio}.rs`, `hash.rs` (152 tests green)
 - [ ] 5. 스테이징 + `run` 파이프라인 (dry-run)
 - [ ] 6. 쓰기 경로 + 휴지통 정책 + `cleanup`
 - [ ] 7. 영상 티어 — `vmaf.rs`, `convert/video_av1.rs`, `bench`
@@ -43,6 +43,10 @@ Full design: `~/.claude/plans/filen-graceful-gadget.md`
 - 영상 저비트레이트 게이트는 면적으로 정규화한 bits/pixel/sec 1.0 (= 1080p 2Mbps, 4K 8Mbps).
   0.03 으로 뒀다가 게이트가 아예 발동하지 않는 버그를 테스트가 잡았다.
 - `plan` 은 다운로드하지 않으므로 영상은 needs_probe 로 남는다. 추정치를 지어내지 말 것.
+- framehash 출력은 헤더 줄이 다를 수 있다 (`#sar 1/1` vs `0/1`). 해시 줄만 비교할 것.
+- ffmpeg 에 JPEG XL 디코더가 없는 빌드가 흔하다. `.jxl` 검증은 `djxl` 로 디코딩한 뒤 해시.
+- `flac --keep-foreign-metadata` 로 WAV→FLAC 도 바이트 복원 가능 (비용 0.3%). 기본으로 쓸 것.
+- `sha2` 0.11 은 해셔에 `io::Write` 를 구현하지 않는다. 청크로 직접 읽어 update.
 
 ### Status
-3단계 완료. 4단계(이미지·오디오 변환 + 검증) 대기 중.
+4단계 완료. 5단계(스테이징 + 동시성 파이프라인) 대기 중.
