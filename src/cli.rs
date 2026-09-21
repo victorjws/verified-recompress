@@ -70,9 +70,15 @@ pub enum Command {
 
     /// Restore an original from its converted form. Byte-reversible classes only.
     Restore {
-        /// Remote path of the converted file.
+        /// Either the original's path or the converted file's.
         path: String,
+        /// Actually write the restored file back to the remote.
+        #[arg(long)]
+        execute: bool,
     },
+
+    /// Report files stored more than once. Read-only; deletes nothing.
+    Dedup,
 
     /// Empty the trash so freed space is actually reclaimed.
     Cleanup {

@@ -17,7 +17,9 @@ use storage_optimizer::pipeline::{self, Pipeline};
 use storage_optimizer::policy::{self, Limits, SkipReason};
 use storage_optimizer::preflight;
 use storage_optimizer::remote::{Remote, rcd::RcdRemote};
+use storage_optimizer::dedup;
 use storage_optimizer::report::Projection;
+use storage_optimizer::restore;
 use storage_optimizer::scope::Scope;
 use storage_optimizer::staging;
 use storage_optimizer::trash;
@@ -59,9 +61,9 @@ async fn main() -> Result<()> {
         Command::Plan => run_plan(&cfg).await,
         Command::Bench { sample } => run_bench(&cfg, *sample).await,
         Command::Report => run_report(&cfg).await,
-        Command::Verify { .. } | Command::Restore { .. } => {
-            bail!("not implemented yet (step 8 of the plan)")
-        }
+        Command::Verify { sample } => run_verify(&cfg, *sample).await,
+        Command::Restore { path, execute } => run_restore(&cfg, path, *execute).await,
+        Command::Dedup => run_dedup(&cfg).await,
         Command::Cleanup { execute } => run_cleanup(&cfg, *execute).await,
     }
 }
@@ -415,6 +417,148 @@ async fn run_bench(cfg: &Config, sample: usize) -> Result<()> {
     println!(
         "  VMAF alone cannot see oversmoothing. Before settling on a preset, pull a\n           few frames from each and look at them, and diff the metadata with:\n             exiftool -a -G1 <original> <converted>\n           Tags worth checking: {}",
         bench::tracked_tags().join(", ")
+    );
+    Ok(())
+}
+
+/// Reports files stored more than once, from the inventory alone.
+async fn run_dedup(cfg: &Config) -> Result<()> {
+    let ledger = Ledger::open(&cfg.staging_dir.join("ledger.sqlite"))?;
+    let scope = Scope::new(&cfg.paths, &cfg.exclude)?;
+
+    let mut rows = Vec::new();
+    for state in [State::Pending, State::Done, State::Skipped, State::Failed] {
+        rows.extend(ledger.list_by_state(state).await?);
+    }
+    rows.retain(|row| scope.allows(&row.path));
+
+    if rows.is_empty() {
+        println!("Nothing in the inventory. Run `scan` first.");
+        return Ok(());
+    }
+    print!("{}", dedup::find(&rows));
+    Ok(())
+}
+
+/// Re-checks conversions that have already happened.
+///
+/// For the byte-exact ones this is the real thing: the converted file is fetched
+/// and rebuilt into its original, then compared with the hash recorded before
+/// anything was replaced. For the rest it confirms the replacement is still
+/// present and the right size, and says so rather than implying more.
+async fn run_verify(cfg: &Config, sample: Option<usize>) -> Result<()> {
+    let ledger = Ledger::open(&cfg.staging_dir.join("ledger.sqlite"))?;
+    let records = ledger.completed(sample).await?;
+    if records.is_empty() {
+        println!("No completed conversions to verify.");
+        return Ok(());
+    }
+
+    let remote = RcdRemote::spawn(cfg.remote.clone(), None).await?;
+    let work = tempfile::tempdir()?;
+    let (mut proven, mut present, mut failed) = (0u32, 0u32, 0u32);
+
+    for record in &records {
+        match verify_one(&remote, record, work.path()).await {
+            Ok(true) => {
+                proven += 1;
+                println!("  rebuilt  {}", record.path);
+            }
+            Ok(false) => {
+                present += 1;
+                println!("  present  {} ({})", record.output_path, record.fidelity);
+            }
+            Err(e) => {
+                failed += 1;
+                println!("  FAILED   {}: {e:#}", record.output_path);
+            }
+        }
+    }
+
+    remote.shutdown().await?;
+    println!(
+        "\n{proven} rebuilt to the original bytes, {present} confirmed present, {failed} failed."
+    );
+    if failed > 0 {
+        bail!("{failed} conversion(s) did not verify");
+    }
+    Ok(())
+}
+
+/// Returns whether the original was actually rebuilt, as opposed to merely found.
+async fn verify_one(
+    remote: &RcdRemote,
+    record: &storage_optimizer::ledger::Completed,
+    work: &std::path::Path,
+) -> Result<bool> {
+    let Some(entry) = remote.stat(&record.output_path).await? else {
+        bail!("missing from the remote");
+    };
+    if entry.size != record.output_size {
+        bail!(
+            "is {} bytes, the ledger recorded {}",
+            entry.size,
+            record.output_size
+        );
+    }
+    if !restore::is_restorable(record) {
+        return Ok(false);
+    }
+
+    let converted = work.join(restore::staged_name("converted", &record.output_path));
+    remote.download(&record.output_path, &converted).await?;
+    let rebuilt = work.join(restore::staged_name("rebuilt", &record.path));
+    restore::rebuild(record, &converted, &rebuilt).await?;
+    restore::confirm(record, &rebuilt).await?;
+    let _ = tokio::fs::remove_file(&converted).await;
+    let _ = tokio::fs::remove_file(&rebuilt).await;
+    Ok(true)
+}
+
+/// Rebuilds one original and puts it back.
+async fn run_restore(cfg: &Config, path: &str, execute: bool) -> Result<()> {
+    let ledger = Ledger::open(&cfg.staging_dir.join("ledger.sqlite"))?;
+    let Some(record) = ledger.completed_for(path).await? else {
+        bail!("no recorded conversion for `{path}`");
+    };
+    if !restore::is_restorable(&record) {
+        bail!("{}", restore::refusal(&record));
+    }
+
+    let remote = RcdRemote::spawn(cfg.remote.clone(), None).await?;
+    let work = tempfile::tempdir()?;
+
+    let converted = work
+        .path()
+        .join(restore::staged_name("converted", &record.output_path));
+    remote.download(&record.output_path, &converted).await?;
+    let rebuilt = work
+        .path()
+        .join(restore::staged_name("rebuilt", &record.path));
+    restore::rebuild(&record, &converted, &rebuilt).await?;
+    restore::confirm(&record, &rebuilt).await?;
+
+    if !execute {
+        println!(
+            "{} rebuilds from {} exactly ({} bytes).\n\n  \
+             Re-run with --execute to put it back; the converted file is left in place.",
+            record.path, record.output_path, record.original_size
+        );
+        remote.shutdown().await?;
+        return Ok(());
+    }
+
+    if remote.stat(&record.path).await?.is_some() {
+        remote.shutdown().await?;
+        bail!("{} already exists; not overwriting it", record.path);
+    }
+    remote.upload(&rebuilt, &record.path).await?;
+    remote.shutdown().await?;
+
+    println!(
+        "Restored {} from {}. The converted file is still there; remove it yourself \n  \
+         once you are satisfied.",
+        record.path, record.output_path
     );
     Ok(())
 }

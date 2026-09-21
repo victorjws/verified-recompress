@@ -119,6 +119,28 @@ enum Cmd {
     Savings {
         reply: oneshot::Sender<Result<Savings>>,
     },
+    Completed {
+        limit: Option<usize>,
+        reply: oneshot::Sender<Result<Vec<Completed>>>,
+    },
+    CompletedFor {
+        path: String,
+        reply: oneshot::Sender<Result<Option<Completed>>>,
+    },
+}
+
+/// A finished replacement, as recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Completed {
+    /// Where the original used to be.
+    pub path: String,
+    pub output_path: String,
+    pub original_size: u64,
+    pub output_size: u64,
+    /// blake3 of the original, from the inventory. What a restore is checked against.
+    pub original_blake3: Option<String>,
+    pub recipe: String,
+    pub fidelity: String,
 }
 
 /// A completed replacement.
@@ -283,6 +305,17 @@ impl Ledger {
     pub async fn savings(&self) -> Result<Savings> {
         self.send(|reply| Cmd::Savings { reply }).await
     }
+
+    /// Completed conversions, largest original first.
+    pub async fn completed(&self, limit: Option<usize>) -> Result<Vec<Completed>> {
+        self.send(|reply| Cmd::Completed { limit, reply }).await
+    }
+
+    /// The conversion recorded for one original path.
+    pub async fn completed_for(&self, path: &str) -> Result<Option<Completed>> {
+        let path = path.to_string();
+        self.send(|reply| Cmd::CompletedFor { path, reply }).await
+    }
 }
 
 fn init_schema(conn: &Connection) -> Result<()> {
@@ -384,6 +417,12 @@ fn actor_loop(mut conn: Connection, mut rx: mpsc::Receiver<Cmd>) {
             }
             Cmd::Savings { reply } => {
                 let _ = reply.send(do_savings(&conn));
+            }
+            Cmd::Completed { limit, reply } => {
+                let _ = reply.send(do_completed(&conn, limit));
+            }
+            Cmd::CompletedFor { path, reply } => {
+                let _ = reply.send(do_completed_for(&conn, &path));
             }
         }
     }
@@ -663,6 +702,45 @@ fn do_savings(conn: &Connection) -> Result<Savings> {
         original_bytes: u64::try_from(original).unwrap_or(0),
         output_bytes: u64::try_from(output).unwrap_or(0),
     })
+}
+
+const COMPLETED_COLUMNS: &str =
+    "path, output_path, size, output_size, blake3, recipe, fidelity";
+
+fn row_to_completed(row: &rusqlite::Row<'_>) -> rusqlite::Result<Completed> {
+    Ok(Completed {
+        path: row.get(0)?,
+        output_path: row.get(1)?,
+        original_size: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
+        output_size: u64::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
+        original_blake3: row.get(4)?,
+        recipe: row.get(5)?,
+        fidelity: row.get(6)?,
+    })
+}
+
+fn do_completed(conn: &Connection, limit: Option<usize>) -> Result<Vec<Completed>> {
+    let sql = format!(
+        "SELECT {COLUMNS} FROM files
+         WHERE state = 'done' AND output_path IS NOT NULL
+         ORDER BY size DESC, path LIMIT ?1",
+        COLUMNS = COMPLETED_COLUMNS
+    );
+    let cap = limit.map_or(-1i64, |n| i64::try_from(n).unwrap_or(i64::MAX));
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![cap], row_to_completed)?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+fn do_completed_for(conn: &Connection, path: &str) -> Result<Option<Completed>> {
+    let sql = format!(
+        "SELECT {COLUMNS} FROM files
+         WHERE state = 'done' AND output_path IS NOT NULL AND (path = ?1 OR output_path = ?1)",
+        COLUMNS = COMPLETED_COLUMNS
+    );
+    Ok(conn
+        .query_row(&sql, params![path], row_to_completed)
+        .optional()?)
 }
 
 #[cfg(test)]
@@ -1060,6 +1138,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ledger.savings().await.unwrap().logical_bytes(), 1242);
+    }
+
+    #[tokio::test]
+    async fn completed_conversions_can_be_listed_and_looked_up() {
+        let ledger = Ledger::open_in_memory().unwrap();
+        ledger
+            .upsert(vec![entry("a.jpg", 1000), entry("b.jpg", 20), entry("c.jpg", 5)])
+            .await
+            .unwrap();
+        ledger.record_conversion(conversion("a.jpg", 800)).await.unwrap();
+        ledger.record_conversion(conversion("b.jpg", 10)).await.unwrap();
+
+        let all = ledger.completed(None).await.unwrap();
+        assert_eq!(all.len(), 2, "only converted files are listed");
+        assert_eq!(all[0].path, "a.jpg", "largest original first");
+        assert_eq!(all[0].output_path, "a.jpg.jxl");
+        assert_eq!(all[0].original_size, 1000);
+        assert_eq!(all[0].output_size, 800);
+        assert_eq!(all[0].original_blake3.as_deref(), Some("hash-of-a.jpg"));
+
+        assert_eq!(ledger.completed(Some(1)).await.unwrap().len(), 1);
+    }
+
+    /// A restore may be asked for by either name, since the original no longer
+    /// exists and the converted file is what the user can see.
+    #[tokio::test]
+    async fn a_conversion_is_findable_by_either_path() {
+        let ledger = Ledger::open_in_memory().unwrap();
+        ledger.upsert(vec![entry("a.jpg", 100)]).await.unwrap();
+        ledger.record_conversion(conversion("a.jpg", 80)).await.unwrap();
+
+        assert!(ledger.completed_for("a.jpg").await.unwrap().is_some());
+        assert!(ledger.completed_for("a.jpg.jxl").await.unwrap().is_some());
+        assert!(ledger.completed_for("nothing").await.unwrap().is_none());
     }
 
     #[test]

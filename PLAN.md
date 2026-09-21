@@ -12,8 +12,8 @@ Full design: `~/.claude/plans/filen-graceful-gadget.md`
 - [x] 5. 스테이징 + 동시성 파이프라인 — `governor.rs`, `staging.rs`, `pipeline.rs` (183 tests green)
 - [x] 6. 쓰기 경로 + 휴지통 정책 + `cleanup` + `report` + `scope.rs` (214 tests green)
 - [x] 7. 영상 티어 — `vmaf.rs`, `convert/video_{av1,lossless}.rs`, `bench.rs` (256 tests green)
-- [ ] 8. dedup / restore
-- [ ] 9. 커밋
+- [x] 8. dedup / restore / verify — `dedup.rs`, `restore.rs` (259 tests green)
+- [x] 9. 커밋
 
 ### Key constraints
 - 전송은 rclone `filen` 백엔드 (1.73+ Tier 1). 공식 `filen-sdk-rs`는 crates.io 미배포라 미사용
@@ -68,6 +68,15 @@ Full design: `~/.claude/plans/filen-graceful-gadget.md`
   (실측 520KB → 523KB). FFV1 은 rawvideo/huffyuv 등 진짜 무압축에만 (실측 93% 절감).
 - ffprobe 프레임 수는 TS 에서 `30\n\n30\n` 처럼 두 번 나온다. 첫 줄만 쓰고, 파싱 실패를
   0 으로 삼키지 말 것 (프레임 수 비교가 무의미해진다).
+- `djxl` 은 **출력** 확장자로 포맷을 정한다. `.bin` 으로 스테이징하면 복원이 실패한다.
+  restore/verify 의 임시 파일은 실제 확장자를 유지할 것 (`restore::staged_name`).
+- restore 가능 여부는 레시피가 아니라 기록된 fidelity 로 판단한다. 같은 flac 레시피라도
+  foreign metadata 가 실렸는지에 따라 byte-exact 일 수도 content-exact 일 수도 있다.
 
 ### Status
-7단계 완료. 8단계(dedup / restore) 대기 중.
+전 단계 완료. 실물 Filen 드라이브 검증만 남음:
+1. CachyOS 에서 `preflight` 통과 확인
+2. `scan` / `plan` (읽기 전용) 으로 예상 절감 확인
+3. `trash_policy = keep` 상태로 좁은 경로 `run --execute --limit 10`
+4. `verify` 로 복원 가능성 확인 후 `cleanup --execute`
+5. `bench --sample 5` 로 preset 확정한 뒤 `--allow-video` 개방
