@@ -272,10 +272,21 @@ impl RcdRemote {
     }
 
     /// The `operations/list` request body, shared by the plain and observed paths.
+    ///
+    /// The scope goes in `fs`, not in `remote`. Both address the same files, but
+    /// they ask the backend for different things: `fs` roots the filesystem at
+    /// the scope, while `remote` roots it at the drive and then descends. Filen
+    /// builds a UUID-to-path map for whatever it is rooted at, so rooting at the
+    /// drive makes listing one small folder cost the whole drive. `CliRemote`
+    /// has always done it this way, which is why the two differed by more than a
+    /// factor of ten on the same folder.
+    ///
+    /// The consequence is that returned paths are relative to the scope and have
+    /// to be prefixed back to remote-root-relative; see [`Self::list_progress`].
     fn list_request(&self, scope: &str) -> Value {
         json!({
-            "fs": remote_spec(&self.remote, ""),
-            "remote": super::normalize_path(scope),
+            "fs": remote_spec(&self.remote, scope),
+            "remote": "",
             "opt": {
                 "recurse": true,
                 "filesOnly": true,
@@ -304,10 +315,11 @@ impl RcdRemote {
         let list = output
             .get("list")
             .context("operations/list response had no `list` field")?;
-        // Unlike `lsjson`, whose paths are relative to the listed directory,
-        // `operations/list` returns paths relative to `fs` with the `remote`
-        // sub-path already included. So the scope must NOT be prefixed again.
-        parse_entries(&list.to_string(), "")
+        // Paths come back relative to `fs`, which `list_request` roots at the
+        // scope, so the scope has to go back on. Prefixing when `fs` is the drive
+        // root instead would double it into `sub/sub/b.txt`; the parity suite
+        // covers both halves of this.
+        parse_entries(&list.to_string(), scope)
     }
 
     /// Empties the trash like [`Remote::cleanup`], reporting progress as it goes.
@@ -742,11 +754,11 @@ mod tests {
         assert_eq!(stats.errors, 1);
     }
 
-    /// The listing body is what makes scope handling correct; `remote` carries the
-    /// scope and `fs` stays at the remote root, which is why paths come back
-    /// already prefixed.
+    /// The scope belongs in `fs`. Putting it in `remote` also works and returns
+    /// the same files, but makes Filen resolve the entire drive to list one
+    /// folder, which is the difference between five seconds and over a minute.
     #[test]
-    fn list_request_puts_the_scope_in_remote_not_fs() {
+    fn list_request_roots_the_filesystem_at_the_scope() {
         let remote = RcdRemote {
             remote: "filen:".into(),
             base_url: String::new(),
@@ -755,9 +767,14 @@ mod tests {
             child: None,
         };
         let body = remote.list_request("/Photos/2019/");
-        assert_eq!(body["fs"], "filen:");
-        assert_eq!(body["remote"], "Photos/2019");
+        assert_eq!(body["fs"], "filen:Photos/2019");
+        assert_eq!(body["remote"], "");
         assert_eq!(body["opt"]["recurse"], true);
         assert_eq!(body["opt"]["hashTypes"][0], HASH_TYPE);
+
+        // An empty scope is the whole drive, and must not become "filen:/".
+        let all = remote.list_request("");
+        assert_eq!(all["fs"], "filen:");
+        assert_eq!(all["remote"], "");
     }
 }

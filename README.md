@@ -373,7 +373,7 @@ Other things worth knowing:
 ## Development
 
 ```sh
-cargo test          # 306 tests
+cargo test          # 307 tests
 cargo build --release
 ```
 

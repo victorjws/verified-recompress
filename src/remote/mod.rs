@@ -173,7 +173,9 @@ pub fn remote_spec(remote: &str, path: &str) -> String {
             let sep = if base.ends_with('/') { "" } else { "/" };
             format!("{remote}{sep}{path}")
         }
-        // Bare path with no remote name at all.
+        // A bare filesystem path with no remote name. `join_path` normalises the
+        // leading slash away, and `/Users/x` is not the same place as `Users/x`.
+        None if remote.starts_with('/') => format!("/{}", join_path(remote, &path)),
         None => join_path(remote, &path),
     }
 }
@@ -282,6 +284,17 @@ mod tests {
         assert_eq!(remote_spec("filen:archive", "/Photos"), "filen:archive/Photos");
         assert_eq!(remote_spec("testlocal:/tmp/tree", "sub"), "testlocal:/tmp/tree/sub");
         assert_eq!(remote_spec("testlocal:/tmp/tree/", "sub"), "testlocal:/tmp/tree/sub");
+    }
+
+    /// A remote given as a bare path may be absolute, and dropping the leading
+    /// slash silently points at a different place — or, more often, at nothing.
+    #[test]
+    fn a_bare_absolute_path_keeps_its_leading_slash() {
+        assert_eq!(remote_spec("/srv/photos", "2019"), "/srv/photos/2019");
+        assert_eq!(remote_spec("/srv/photos", ""), "/srv/photos");
+        assert_eq!(remote_spec("/srv/photos/", "/2019/"), "/srv/photos/2019");
+        // Relative bare paths stay relative.
+        assert_eq!(remote_spec("photos", "2019"), "photos/2019");
     }
 
     #[test]
