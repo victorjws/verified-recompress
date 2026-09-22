@@ -95,7 +95,7 @@ async fn transport_stream_remux_is_a_true_stream_copy() {
 
     let output = work.path("out.mp4");
     let fp = convert::fingerprint(Recipe::TsRemux, &ts).await.unwrap();
-    convert::encode(Recipe::TsRemux, &ts, &output, &[], VideoOptions::default())
+    convert::encode(Recipe::TsRemux, &ts, &output, work.dir.path(), &[], VideoOptions::default())
         .await
         .unwrap();
 
@@ -173,7 +173,7 @@ async fn ffv1_preserves_every_frame() {
 
     let output = work.path("out.mkv");
     let fp = convert::fingerprint(Recipe::Ffv1, &source).await.unwrap();
-    convert::encode(Recipe::Ffv1, &source, &output, &[], VideoOptions::default())
+    convert::encode(Recipe::Ffv1, &source, &output, work.dir.path(), &[], VideoOptions::default())
         .await
         .unwrap();
 

@@ -48,6 +48,7 @@ these must be on `PATH`:
 | --- | --- | --- |
 | `rclone` | all remote access | **1.73 or newer**, which is when the Filen backend reached Tier 1 |
 | `cjxl` / `djxl` | image tier | `djxl` must support `-J` / `--reconstruct_jpeg`, or JPEGs cannot be rebuilt |
+| `dwebp` | lossless WebP only | cjxl reads no WebP, so one is expanded to PNG first. Optional: without it that one recipe fails and the rest are unaffected |
 | `ffmpeg` | video tier | must be built with `libsvtav1` **and** the `libvmaf` filter |
 | `ffprobe` | classifying video | ships with ffmpeg |
 | `flac` | audio tier | needs `--keep-foreign-metadata` |
@@ -183,6 +184,24 @@ go out as a log line every 15 seconds instead.
 Inventoried 12,043 file(s) across 2 scope(s).
   pending 11,890  done 0  skipped 153  failed 0  total 412.7 GB
 ```
+
+#### WebP
+
+Lossless WebP goes to JXL; lossy WebP does not. The two are told apart by the RIFF chunk at byte
+12 before anything is downloaded, because the answer is not close:
+
+| | source | to lossless JXL |
+| --- | --- | --- |
+| lossless WebP (photo) | 1,815,890 | 1,691,575 (**−6.8%**) |
+| lossy WebP q90 | 112,772 | 947,982 (+741%) |
+| lossy WebP q80 | 69,640 | 973,145 (+1297%) |
+
+A lossy WebP's compression artifacts are structure the new encoder has to spend bits reproducing,
+so storing them losslessly costs several times the original. Re-encoding it lossily would be
+smaller, but only by selling quality: at a JXL distance that keeps the WebP's appearance
+(ssimulacra2 ≈ 85) the file is still about half again as large, and it only drops below the
+original once the picture has visibly degraded. JXL does beat WebP by roughly 23% at equal quality
+— but only when encoding from the original, which by then is gone.
 
 ### `plan`
 
@@ -342,8 +361,8 @@ drive still full" is answerable from `plan` and `report`.
 
 | Reason | Meaning |
 | --- | --- |
-| `already_optimal` | already HEIC/AVIF/WebP/JXL; re-encoding would only add loss |
-| `lossy_no_gain` | lossy source with no lossless path to a smaller file (MP3, AAC, AAC-in-`.m4a`) |
+| `already_optimal` | already HEIC/AVIF/JXL; re-encoding would only add loss |
+| `lossy_no_gain` | lossy source with no lossless path to a smaller file (MP3, AAC, AAC-in-`.m4a`, lossy WebP) |
 | `too_small` | under 4 KiB, or zero bytes |
 | `too_large_for_budget` | would not fit in the staging budget |
 | `video_hdr` | HDR10, HLG or Dolby Vision; re-encoding loses the mastering metadata |
@@ -389,7 +408,7 @@ Other things worth knowing:
 ## Development
 
 ```sh
-cargo test          # 315 tests
+cargo test          # 320 tests
 cargo build --release
 ```
 

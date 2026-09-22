@@ -65,7 +65,7 @@ fn size(path: &Path) -> u64 {
 async fn round_trip(recipe: Recipe, input: &Path, work: &Work, out_name: &str) -> (Fidelity, u64, u64) {
     let output = work.path(out_name);
     let fp = convert::fingerprint(recipe, input).await.unwrap();
-    convert::encode(recipe, input, &output, &[], Default::default())
+    convert::encode(recipe, input, &output, work.dir.path(), &[], Default::default())
         .await
         .unwrap();
     let fidelity = convert::verify(recipe, &output, &fp, work.dir.path(), &[])
@@ -142,6 +142,92 @@ async fn png_round_trips_pixel_identically_and_shrinks() {
     assert!(after < before, "{after} should be smaller than {before}");
 }
 
+/// Lossless WebP is the one member of the "already efficient" family JXL can
+/// still beat, and cjxl cannot read it, so the recipe goes through a decode
+/// step. This checks the whole path, pixels included.
+#[tokio::test]
+async fn lossless_webp_round_trips_pixel_identically_and_shrinks() {
+    require!(
+        "ffmpeg" => "-version",
+        "cwebp" => "-version",
+        "dwebp" => "-version",
+        "cjxl" => "--version",
+        "djxl" => "--version"
+    );
+    let work = Work::new();
+    let png = work.make(
+        "in.png",
+        &["-f", "lavfi", "-i", "testsrc2=size=640x480", "-frames:v", "1"],
+    );
+
+    let webp = work.path("in.webp");
+    let status = Command::new("cwebp")
+        .args(["-quiet", "-lossless"])
+        .arg(&png)
+        .arg("-o")
+        .arg(&webp)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let (fidelity, before, after) =
+        round_trip(Recipe::JxlFromWebp, &webp, &work, "out.jxl").await;
+
+    assert_eq!(fidelity, Fidelity::ContentExact);
+    assert!(after < before, "{after} should be smaller than {before}");
+}
+
+/// The guarantee is pixel identity, so a WebP whose JXL decodes to something
+/// else has to fail rather than be accepted on size alone.
+#[tokio::test]
+async fn a_webp_conversion_that_changes_pixels_fails_verification() {
+    require!(
+        "ffmpeg" => "-version",
+        "cwebp" => "-version",
+        "dwebp" => "-version",
+        "cjxl" => "--version",
+        "djxl" => "--version"
+    );
+    let work = Work::new();
+    let png = work.make(
+        "a.png",
+        &["-f", "lavfi", "-i", "testsrc2=size=320x240", "-frames:v", "1"],
+    );
+    let webp = work.path("a.webp");
+    assert!(
+        Command::new("cwebp")
+            .args(["-quiet", "-lossless"])
+            .arg(&png)
+            .arg("-o")
+            .arg(&webp)
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    // Fingerprint the real source, then hand verification a JXL of a different
+    // image entirely.
+    let fp = convert::fingerprint(Recipe::JxlFromWebp, &webp).await.unwrap();
+    let other = work.make(
+        "other.png",
+        &["-f", "lavfi", "-i", "testsrc2=size=320x240:rate=1", "-frames:v", "1", "-ss", "3"],
+    );
+    let output = work.path("out.jxl");
+    convert::encode(
+        Recipe::JxlFromRaster,
+        &other,
+        &output,
+        work.dir.path(),
+        &[],
+        Default::default(),
+    )
+    .await
+    .unwrap();
+
+    let result = convert::verify(Recipe::JxlFromWebp, &output, &fp, work.dir.path(), &[]).await;
+    assert!(result.is_err(), "different pixels must not verify");
+}
+
 /// Corrupting the output must be caught. Without this, "verification" could be
 /// passing vacuously and nobody would know.
 #[tokio::test]
@@ -160,7 +246,7 @@ async fn a_damaged_raster_output_fails_verification() {
         &["-f", "lavfi", "-i", "testsrc2=size=320x240:rate=1", "-frames:v", "1", "-vf", "negate"],
     );
     let output = work.path("out.jxl");
-    convert::encode(Recipe::JxlFromRaster, &other, &output, &[], Default::default())
+    convert::encode(Recipe::JxlFromRaster, &other, &output, work.dir.path(), &[], Default::default())
         .await
         .unwrap();
 
@@ -204,7 +290,7 @@ async fn flac_output_that_does_not_match_the_source_fails() {
 
     let fp = convert::fingerprint(Recipe::Flac, &input).await.unwrap();
     let output = work.path("out.flac");
-    convert::encode(Recipe::Flac, &other, &output, &[], Default::default())
+    convert::encode(Recipe::Flac, &other, &output, work.dir.path(), &[], Default::default())
         .await
         .unwrap();
 
@@ -249,7 +335,7 @@ async fn verification_works_after_the_source_is_deleted() {
     let output = work.path("out.jxl");
 
     let fp = convert::fingerprint(Recipe::JxlFromJpeg, &input).await.unwrap();
-    convert::encode(Recipe::JxlFromJpeg, &input, &output, &[], Default::default())
+    convert::encode(Recipe::JxlFromJpeg, &input, &output, work.dir.path(), &[], Default::default())
         .await
         .unwrap();
     std::fs::remove_file(&input).unwrap();

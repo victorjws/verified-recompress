@@ -96,7 +96,34 @@ async fn run_ffmpeg(args: &[&str], path: &Path) -> Result<String> {
 /// frame regardless of how they are stored.
 pub async fn frame_hash(path: &Path) -> Result<String> {
     let raw = run_ffmpeg(&["-map", "0:v", "-f", "framehash", "-hash", "sha256", "-"], path).await?;
-    let hashes = extract_hash_lines(&raw);
+    frames_from(&raw, path)
+}
+
+/// Frame hashes with the pixels converted to `pix_fmt` first.
+///
+/// A source and its round trip can hold identical pixels and still hash
+/// differently, because ffmpeg decodes each container in its own native format:
+/// WebP comes back as ARGB, and the PNG a JXL decodes to is RGB24 whenever there
+/// is no alpha. Four channels against three never matches, whatever the pixels
+/// say. Converting both sides first compares the picture rather than its
+/// memory layout.
+///
+/// Only for sources that fit the target format without loss. Forcing an 8-bit
+/// format on a 16-bit PNG would quietly discard the precision the guarantee is
+/// about, so this is not the default.
+pub async fn frame_hash_as(path: &Path, pix_fmt: &str) -> Result<String> {
+    let raw = run_ffmpeg(
+        &[
+            "-map", "0:v", "-pix_fmt", pix_fmt, "-f", "framehash", "-hash", "sha256", "-",
+        ],
+        path,
+    )
+    .await?;
+    frames_from(&raw, path)
+}
+
+fn frames_from(raw: &str, path: &Path) -> Result<String> {
+    let hashes = extract_hash_lines(raw);
     if hashes.is_empty() {
         bail!("no frames decoded from {}", path.display());
     }

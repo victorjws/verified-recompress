@@ -126,9 +126,10 @@ impl fmt::Display for Projection {
 }
 
 /// Recipes worth naming in a summary line, in the order a reader cares about.
-pub const ALL_RECIPES: [Recipe; 7] = [
+pub const ALL_RECIPES: [Recipe; 8] = [
     Recipe::JxlFromJpeg,
     Recipe::JxlFromRaster,
+    Recipe::JxlFromWebp,
     Recipe::Flac,
     Recipe::FlacRecompress,
     Recipe::TsRemux,

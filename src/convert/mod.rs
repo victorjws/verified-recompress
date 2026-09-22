@@ -61,6 +61,10 @@ pub enum ContentHash {
 }
 
 /// Takes whatever digests the recipe's verification will need.
+/// What both sides of a WebP comparison are put into. WebP stores 8-bit ARGB,
+/// so nothing is lost on the way in or out.
+const WEBP_PIX_FMT: &str = "rgba";
+
 pub async fn fingerprint(recipe: Recipe, input: &Path) -> Result<Fingerprint> {
     let sha256 = hash::sha256_file(input).await?;
     let content = match recipe {
@@ -68,6 +72,11 @@ pub async fn fingerprint(recipe: Recipe, input: &Path) -> Result<Fingerprint> {
         // against the file bytes rather than pixels for the reasons in `jxl`.
         Recipe::JxlFromJpeg => None,
         Recipe::JxlFromRaster => Some(ContentHash::Pixels(hash::frame_hash(input).await?)),
+        // WebP is an 8-bit ARGB format, so normalising costs nothing and makes
+        // the comparison against the decoded JXL possible at all.
+        Recipe::JxlFromWebp => Some(ContentHash::Pixels(
+            hash::frame_hash_as(input, WEBP_PIX_FMT).await?,
+        )),
         // Audio keeps a sample digest as a fallback for sources whose container
         // metadata FLAC cannot carry across.
         Recipe::Flac | Recipe::FlacRecompress => {
@@ -115,12 +124,15 @@ pub async fn encode(
     recipe: Recipe,
     input: &Path,
     output: &Path,
+    work_dir: &Path,
     cores: &[usize],
     video: VideoOptions,
 ) -> Result<()> {
     match recipe {
         Recipe::JxlFromJpeg => jxl::encode_from_jpeg(input, output, cores).await,
-        Recipe::JxlFromRaster => jxl::encode_from_raster(input, output, cores).await,
+        Recipe::JxlFromRaster | Recipe::JxlFromWebp => {
+            jxl::encode_from_raster(input, output, work_dir, cores).await
+        }
         Recipe::Flac | Recipe::FlacRecompress => audio::encode_flac(input, output, cores).await,
         Recipe::TsRemux => {
             video_lossless::remux_to_mp4(input, output, cores, video.allow_discard_corrupt).await
@@ -159,7 +171,13 @@ pub async fn verify(
             let Some(ContentHash::Pixels(expected)) = &fingerprint.content else {
                 bail!("a raster conversion needs a pixel fingerprint");
             };
-            jxl::verify_raster(output, expected, work_dir).await
+            jxl::verify_raster(output, expected, work_dir, None).await
+        }
+        Recipe::JxlFromWebp => {
+            let Some(ContentHash::Pixels(expected)) = &fingerprint.content else {
+                bail!("a raster conversion needs a pixel fingerprint");
+            };
+            jxl::verify_raster(output, expected, work_dir, Some(WEBP_PIX_FMT)).await
         }
         Recipe::Flac | Recipe::FlacRecompress => {
             let Some(ContentHash::Pcm(expected)) = &fingerprint.content else {

@@ -38,6 +38,9 @@ pub enum Recipe {
     JxlFromJpeg,
     /// PNG/GIF/BMP/TIFF to JPEG XL. Pixel-identical, not byte-identical.
     JxlFromRaster,
+    /// Lossless WebP to JPEG XL. Pixel-identical, and a much smaller win than
+    /// the other raster sources, which is why it is not folded into them.
+    JxlFromWebp,
     /// PCM to FLAC. Sample-identical, verified against the stored PCM MD5.
     Flac,
     /// Re-encode an existing lossless audio file at maximum compression.
@@ -57,6 +60,10 @@ impl Recipe {
         match self {
             Recipe::JxlFromJpeg => 0.80,
             Recipe::JxlFromRaster => 0.65,
+            // Measured on real images rather than assumed: lossless WebP is
+            // already well compressed, so JXL buys 6-7%, not the third that a
+            // PNG gives up.
+            Recipe::JxlFromWebp => 0.93,
             Recipe::Flac => 0.55,
             Recipe::FlacRecompress => 0.94,
             Recipe::TsRemux => 0.96,
@@ -77,7 +84,7 @@ impl Recipe {
 
     pub fn output_extension(self, source_ext: &str) -> &'static str {
         match self {
-            Recipe::JxlFromJpeg | Recipe::JxlFromRaster => "jxl",
+            Recipe::JxlFromJpeg | Recipe::JxlFromRaster | Recipe::JxlFromWebp => "jxl",
             Recipe::Flac | Recipe::FlacRecompress => "flac",
             Recipe::TsRemux => "mp4",
             Recipe::Ffv1 => "mkv",
@@ -94,6 +101,7 @@ impl Recipe {
         match self {
             Recipe::JxlFromJpeg => "jxl-from-jpeg",
             Recipe::JxlFromRaster => "jxl-from-raster",
+            Recipe::JxlFromWebp => "jxl-from-webp",
             Recipe::Flac => "flac",
             Recipe::FlacRecompress => "flac-recompress",
             Recipe::TsRemux => "ts-remux",
@@ -216,12 +224,17 @@ impl Limits {
 pub fn projected_saving(path: &str, size: u64) -> u64 {
     let ratio = match decide(Facts::new(path, size), Limits::unbounded()) {
         Decision::Convert(recipe) => recipe.expected_ratio(),
-        // A video cannot be judged without downloading it, so at intake time its
-        // saving is unknown. Guessing the AV1 ratio is right here and wrong in
-        // `report`: a projection shown to a person must not promise a saving
-        // nobody measured, but a sort key that treated every video as worthless
-        // would put the biggest wins on the drive dead last.
-        Decision::Skip(SkipReason::NeedsProbe) => Recipe::Av1.expected_ratio(),
+        // Some files cannot be judged without their bytes, so at intake time
+        // their saving is unknown. Guessing is right here and wrong in `report`:
+        // a projection shown to a person must not promise a saving nobody
+        // measured, but a sort key that treated every video as worthless would
+        // put the biggest wins on the drive dead last. The guess follows the
+        // recipe each kind would most likely reach, so a WebP is not queued as
+        // if it were a film.
+        Decision::Skip(SkipReason::NeedsProbe) => match kind_from_extension(path) {
+            Kind::Webp => Recipe::JxlFromWebp.expected_ratio(),
+            _ => Recipe::Av1.expected_ratio(),
+        },
         Decision::Skip(_) => return 0,
     };
     size.saturating_sub((size as f64 * ratio) as u64)
@@ -295,6 +308,19 @@ pub fn decide(facts: Facts<'_>, limits: Limits) -> Decision {
 
     match kind {
         Kind::Jpeg => Decision::Convert(Recipe::JxlFromJpeg),
+
+        // Only the bytes say whether a WebP is lossless, and only a lossless one
+        // is worth touching: re-encoding a lossy WebP losslessly multiplies its
+        // size, and re-encoding it lossily would sell quality for bytes, which
+        // is not a trade this tool makes.
+        Kind::Webp => match head {
+            None => Decision::Skip(SkipReason::NeedsProbe),
+            Some(head) if crate::classify::is_lossless_webp(head) => {
+                Decision::Convert(Recipe::JxlFromWebp)
+            }
+            Some(_) => Decision::Skip(SkipReason::LossyNoGain),
+        },
+
         Kind::Png | Kind::Gif | Kind::Bmp | Kind::Tiff => Decision::Convert(Recipe::JxlFromRaster),
         Kind::EfficientImage => Decision::Skip(SkipReason::AlreadyOptimal),
 
@@ -492,13 +518,68 @@ mod tests {
 
     #[test]
     fn efficient_images_are_left_alone() {
-        for path in ["a.heic", "a.avif", "a.webp", "a.jxl"] {
+        for path in ["a.heic", "a.avif", "a.jxl"] {
             assert_eq!(
                 decide(Facts::new(path, BIG), limits()),
                 Decision::Skip(SkipReason::AlreadyOptimal),
                 "{path}"
             );
         }
+    }
+
+    fn webp(chunk: &[u8; 4]) -> Vec<u8> {
+        let mut head = b"RIFF\0\0\0\0WEBP".to_vec();
+        head.extend_from_slice(chunk);
+        head
+    }
+
+    /// A lossless WebP re-encodes about 6-7% smaller with its pixels intact; a
+    /// lossy one grows severalfold. Only the bytes tell them apart, so the whole
+    /// decision hangs on reading them.
+    #[test]
+    fn only_lossless_webp_goes_to_jxl() {
+        let lossless = webp(b"VP8L");
+        assert_eq!(
+            decide(Facts::new("a.webp", BIG).with_head(&lossless), limits()),
+            Decision::Convert(Recipe::JxlFromWebp)
+        );
+
+        let lossy = webp(b"VP8 ");
+        assert_eq!(
+            decide(Facts::new("a.webp", BIG).with_head(&lossy), limits()),
+            Decision::Skip(SkipReason::LossyNoGain)
+        );
+
+        // The extended form can hold either, plus alpha and animation. Reading it
+        // means walking the chunk list, so it is left alone rather than guessed at.
+        let extended = webp(b"VP8X");
+        assert_eq!(
+            decide(Facts::new("a.webp", BIG).with_head(&extended), limits()),
+            Decision::Skip(SkipReason::LossyNoGain)
+        );
+    }
+
+    /// `plan` does not download, so it cannot know which kind of WebP it has.
+    #[test]
+    fn a_webp_without_its_bytes_needs_a_probe() {
+        assert_eq!(
+            decide(Facts::new("a.webp", BIG), limits()),
+            Decision::Skip(SkipReason::NeedsProbe)
+        );
+    }
+
+    /// Intake order guesses a recipe for anything it cannot judge yet. A WebP
+    /// must not be queued as though it were a film.
+    #[test]
+    fn an_unjudged_webp_is_not_ranked_like_a_video() {
+        let size = 1_000_000;
+        assert_eq!(
+            projected_saving("a.webp", size),
+            size - (size as f64 * Recipe::JxlFromWebp.expected_ratio()) as u64
+        );
+        // And a WebP projects far less than a PNG of the same size, because it
+        // is already compressed.
+        assert!(projected_saving("a.png", size) > projected_saving("a.webp", size));
     }
 
     #[test]

@@ -32,7 +32,7 @@ pub fn bytes_to_mib(bytes: u64) -> u32 {
 pub fn peak_reservation_ratio(recipe: Recipe) -> f64 {
     match recipe {
         // input + output, then input dropped and the djxl rebuild written.
-        Recipe::JxlFromJpeg | Recipe::JxlFromRaster => 1.8,
+        Recipe::JxlFromJpeg | Recipe::JxlFromRaster | Recipe::JxlFromWebp => 1.8,
         Recipe::Flac | Recipe::FlacRecompress => 1.5,
         Recipe::TsRemux => 1.95,
         // Lossless video can grow, and framemd5 needs both sides present.

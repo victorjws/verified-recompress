@@ -267,7 +267,15 @@ impl<R: Remote + 'static> Pipeline<R> {
             let fingerprint = convert::fingerprint(recipe, &input).await?;
             {
                 let cpu = self.governor.cpu(recipe).await;
-                convert::encode(recipe, &input, &output, cpu.cores(), opts.video).await?;
+                convert::encode(
+                    recipe,
+                    &input,
+                    &output,
+                    workspace.path(),
+                    cpu.cores(),
+                    opts.video,
+                )
+                .await?;
             }
 
             // Verification works from the recorded fingerprint, so the source can

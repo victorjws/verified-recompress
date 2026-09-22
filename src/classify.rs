@@ -24,8 +24,11 @@ pub enum Kind {
     Gif,
     Bmp,
     Tiff,
-    /// Already-efficient stills: HEIC, AVIF, lossy WebP, existing JXL.
+    /// Already-efficient stills: HEIC, AVIF, existing JXL.
     EfficientImage,
+    /// `.webp`, which may be lossless (VP8L) or lossy (VP8). Only the magic
+    /// bytes say which, and the answer decides whether JXL can help at all.
+    Webp,
     /// Uncompressed PCM containers.
     Wav,
     Aiff,
@@ -65,7 +68,8 @@ pub fn kind_from_extension(path: &str) -> Kind {
         "gif" => Kind::Gif,
         "bmp" | "dib" => Kind::Bmp,
         "tif" | "tiff" => Kind::Tiff,
-        "heic" | "heif" | "avif" | "webp" | "jxl" => Kind::EfficientImage,
+        "heic" | "heif" | "avif" | "jxl" => Kind::EfficientImage,
+        "webp" => Kind::Webp,
         "wav" | "wave" => Kind::Wav,
         "aif" | "aiff" | "aifc" => Kind::Aiff,
         "flac" => Kind::Flac,
@@ -86,6 +90,25 @@ pub fn kind_from_extension(path: &str) -> Kind {
 /// A transport stream is a run of 188-byte packets each beginning with 0x47.
 /// Checking several packets in a row rather than just the first byte avoids
 /// matching text that happens to start with `G`.
+/// Whether a WebP is the lossless (VP8L) variety.
+///
+/// Measured on real images: lossless WebP re-encodes to JXL about 6-7% smaller
+/// with the pixels intact, while a lossy one grows sevenfold or more, because
+/// its compression artifacts are structure the new encoder has to spend bits
+/// reproducing. So the two have to be told apart before anything is downloaded,
+/// and the RIFF chunk at byte 12 says which is which.
+///
+/// `VP8X` is the extended form and may hold either, plus alpha or animation.
+/// Reading it properly means walking the chunk list, so it reads as "not
+/// known lossless" and is left alone.
+pub fn is_lossless_webp(head: &[u8]) -> bool {
+    const CHUNK: usize = 12;
+    if head.len() < CHUNK + 4 {
+        return false;
+    }
+    &head[0..4] == b"RIFF" && &head[8..12] == b"WEBP" && &head[CHUNK..CHUNK + 4] == b"VP8L"
+}
+
 pub fn is_mpeg_ts(head: &[u8]) -> bool {
     const REQUIRED: usize = 4;
     if head.len() < TS_PACKET * REQUIRED {
@@ -279,6 +302,7 @@ mod tests {
         assert_eq!(kind_from_extension("x.PNG"), Kind::Png);
         assert_eq!(kind_from_extension("x.heic"), Kind::EfficientImage);
         assert_eq!(kind_from_extension("x.jxl"), Kind::EfficientImage);
+        assert_eq!(kind_from_extension("x.webp"), Kind::Webp);
         assert_eq!(kind_from_extension("x.wav"), Kind::Wav);
         assert_eq!(kind_from_extension("x.m4a"), Kind::M4a);
         assert_eq!(kind_from_extension("x.mp3"), Kind::LossyAudio);

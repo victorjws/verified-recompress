@@ -24,14 +24,50 @@ pub async fn encode_from_jpeg(input: &Path, output: &Path, cores: &[usize]) -> R
     run(cmd, "cjxl (jpeg transcode)").await
 }
 
-/// Losslessly encodes PNG, GIF, BMP, or TIFF.
-pub async fn encode_from_raster(input: &Path, output: &Path, cores: &[usize]) -> Result<()> {
+/// Losslessly encodes PNG, GIF, BMP, TIFF, or lossless WebP.
+///
+/// cjxl reads none of the WebP family, so one of those is decoded to PNG first.
+/// The intermediate is lossless in both directions, so the pixels reaching cjxl
+/// are the pixels the source held, which is what the verification compares.
+pub async fn encode_from_raster(
+    input: &Path,
+    output: &Path,
+    work_dir: &Path,
+    cores: &[usize],
+) -> Result<()> {
+    let decoded;
+    let source = if is_webp(input) {
+        decoded = work_dir.join("webp-decoded.png");
+        decode_webp(input, &decoded, cores).await?;
+        decoded.as_path()
+    } else {
+        input
+    };
+
     let mut cmd = command("cjxl", cores);
     cmd.args(["-d", "0", "-e", EFFORT])
         .arg(threads_flag(cores))
-        .arg(input)
+        .arg(source)
         .arg(output);
-    run(cmd, "cjxl (raster)").await
+    let result = run(cmd, "cjxl (raster)").await;
+
+    if source != input {
+        let _ = tokio::fs::remove_file(source).await;
+    }
+    result
+}
+
+fn is_webp(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("webp"))
+}
+
+/// Expands a WebP to PNG. `dwebp` is libwebp's own decoder, so it agrees with
+/// whatever produced the file.
+async fn decode_webp(input: &Path, output: &Path, cores: &[usize]) -> Result<()> {
+    let mut cmd = command("dwebp", cores);
+    cmd.arg("-quiet").arg(input).arg("-o").arg(output);
+    run(cmd, "dwebp (webp decode)").await
 }
 
 fn threads_flag(cores: &[usize]) -> String {
@@ -94,6 +130,7 @@ pub async fn verify_raster(
     output: &Path,
     expected_pixels: &str,
     work_dir: &Path,
+    pix_fmt: Option<&str>,
 ) -> Result<Fidelity> {
     let decoded = work_dir.join("roundtrip.png");
 
@@ -103,7 +140,10 @@ pub async fn verify_raster(
         bail!("{} could not be decoded back to pixels", output.display());
     }
 
-    let actual = hash::frame_hash(&decoded).await;
+    let actual = match pix_fmt {
+        Some(fmt) => hash::frame_hash_as(&decoded, fmt).await,
+        None => hash::frame_hash(&decoded).await,
+    };
     let _ = tokio::fs::remove_file(&decoded).await;
 
     if actual? != expected_pixels {

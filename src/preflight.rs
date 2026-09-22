@@ -394,6 +394,19 @@ pub async fn run(cfg: &Config) -> Result<Report> {
         None => report.findings.push(Finding::error("djxl", "not found")),
     }
 
+    // cjxl reads no WebP at all, so a lossless one is expanded to PNG first.
+    // Only the WebP recipe needs this, which is why its absence is a warning
+    // rather than an error: everything else still runs.
+    match capture("dwebp", &["-version"]).await {
+        Some(version) => report
+            .versions
+            .push(("dwebp", Version::parse(&version))),
+        None => report.findings.push(Finding::warn(
+            "dwebp",
+            "not found, so lossless WebP files will fail to convert; the other recipes are unaffected",
+        )),
+    }
+
     let ffmpeg_version = capture("ffmpeg", &["-hide_banner", "-version"]).await;
     report
         .versions
