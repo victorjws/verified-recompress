@@ -26,11 +26,24 @@ use super::{About, Entry, HASH_TYPE, Remote, parse_about, parse_entries, remote_
 
 /// How long to wait for the daemon's listener to come up.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
+/// How often to check for it. It binds in well under 100ms, so asking at that
+/// rate spends most of the startup asleep.
+const READY_POLL: Duration = Duration::from_millis(20);
 /// Grace period for a polite `core/quit` before the child is killed.
-const SHUTDOWN_GRACE: Duration = Duration::from_millis(1500);
-/// How often to ask how a long-running job is doing. The calls go over loopback,
-/// so the cost is noise next to a listing that runs for minutes.
-const POLL_INTERVAL: Duration = Duration::from_secs(1);
+///
+/// Measured against rclone 1.75.1: `core/quit` acknowledges immediately but the
+/// process takes about 1.5s to actually go. Waiting that out would put a second
+/// and a half on every command for nothing, because everything this tool depends
+/// on has already returned — uploads are confirmed by `hashsumfile` and the
+/// ledger is ours — so the daemon holds no state worth draining.
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
+/// How often to ask how a long-running job is doing.
+///
+/// The wait starts short and backs off: a listing that finishes in milliseconds
+/// should not pay a full second to notice, and one that runs for minutes should
+/// not be asked every 20ms.
+const POLL_MIN: Duration = Duration::from_millis(20);
+const POLL_MAX: Duration = Duration::from_secs(1);
 const RC_USER: &str = "verified-recompress";
 
 pub struct RcdRemote {
@@ -89,7 +102,7 @@ impl RcdRemote {
                 Ok(_) => return Ok(()),
                 Err(e) => last = Some(e),
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(READY_POLL).await;
         }
         match last {
             Some(e) => Err(e).context("rclone rcd did not become ready"),
@@ -181,6 +194,7 @@ impl RcdRemote {
         jobid: u64,
         mut on_tick: impl FnMut(&JobStats) + Send,
     ) -> Result<Value> {
+        let mut wait = POLL_MIN;
         loop {
             let value = self.call("job/status", json!({ "jobid": jobid })).await?;
             let status: JobStatus = serde_json::from_value(value)
@@ -198,7 +212,8 @@ impl RcdRemote {
             }
 
             on_tick(&self.job_stats(&status.group).await);
-            tokio::time::sleep(POLL_INTERVAL).await;
+            tokio::time::sleep(wait).await;
+            wait = backoff(wait);
         }
     }
 
@@ -453,6 +468,11 @@ impl Remote for RcdRemote {
     }
 }
 
+/// Doubles the poll wait up to [`POLL_MAX`].
+fn backoff(wait: Duration) -> Duration {
+    wait.saturating_mul(2).min(POLL_MAX)
+}
+
 /// Splits a local file path into the (directory, filename) pair the rc API wants.
 ///
 /// `operations/copyfile` addresses both ends as a filesystem plus a name within it;
@@ -517,6 +537,34 @@ mod tests {
         let present: StatResponse =
             serde_json::from_str(r#"{"item": {"Path":"a.txt","Size":5,"IsDir":false}}"#).unwrap();
         assert!(present.item.is_some());
+    }
+
+    /// A job that finishes at once must not pay a full poll interval to notice,
+    /// and one that runs for minutes must not be asked every 20ms.
+    #[test]
+    fn polling_starts_short_and_settles_at_the_cap() {
+        assert!(POLL_MIN < POLL_MAX);
+        let mut wait = POLL_MIN;
+        let mut total = Duration::ZERO;
+        let mut steps = 0;
+        while wait < POLL_MAX {
+            total += wait;
+            wait = backoff(wait);
+            steps += 1;
+        }
+        assert_eq!(wait, POLL_MAX, "the wait settles exactly at the cap");
+        assert_eq!(backoff(POLL_MAX), POLL_MAX, "and stays there");
+
+        // The point of starting short is latency on a job that is already done:
+        // the worst case is one POLL_MIN of waiting, not one POLL_MAX.
+        assert!(POLL_MIN <= Duration::from_millis(50));
+
+        // And the ramp has to be brisk, or a long listing spends its first
+        // minute being asked far too often.
+        assert!(
+            steps <= 8,
+            "took {steps} steps and {total:?} to reach the cap"
+        );
     }
 
     #[test]
