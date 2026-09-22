@@ -12,6 +12,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::config::Order;
 use crate::remote::Entry;
 
 /// Where a file sits in the pipeline. Stored as text so the database stays readable.
@@ -91,6 +92,7 @@ enum Cmd {
     },
     ClaimNext {
         prefixes: Vec<String>,
+        order: Order,
         reply: oneshot::Sender<Result<Option<FileRow>>>,
     },
     SetState {
@@ -244,14 +246,19 @@ impl Ledger {
         self.send(|reply| Cmd::ListByState { state, reply }).await
     }
 
-    /// Atomically takes the next pending file within `prefixes`, largest first.
+    /// Atomically takes the next pending file within `prefixes`, in `order`.
     ///
     /// The filter is applied here rather than after claiming, so a scoped run can
     /// never pick up a file outside its scope even momentarily. An empty slice
     /// means the whole remote.
-    pub async fn claim_next(&self, prefixes: &[String]) -> Result<Option<FileRow>> {
+    pub async fn claim_next(&self, prefixes: &[String], order: Order) -> Result<Option<FileRow>> {
         let prefixes = prefixes.to_vec();
-        self.send(|reply| Cmd::ClaimNext { prefixes, reply }).await
+        self.send(|reply| Cmd::ClaimNext {
+            prefixes,
+            order,
+            reply,
+        })
+        .await
     }
 
     pub async fn set_state(
@@ -335,7 +342,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
             seen_at     TEXT NOT NULL DEFAULT (datetime('now'))
         );
         CREATE INDEX IF NOT EXISTS files_state ON files(state);
-        -- Intake order is by projected savings, so the quota drops fastest early.
+        -- One index per intake order, so `claim_next` never sorts the table.
         CREATE INDEX IF NOT EXISTS files_state_size ON files(state, size DESC);
         "#,
     )?;
@@ -365,12 +372,21 @@ fn migrate(conn: &Connection) -> Result<()> {
         ("trashed_at", "TEXT"),
         // Set once the space has genuinely been reclaimed.
         ("reclaimed", "INTEGER NOT NULL DEFAULT 0"),
+        // What `Order::Savings` sorts on. A ledger predating this column reads as
+        // zero everywhere, which degrades that order to the size tiebreaker until
+        // the next scan rather than producing a wrong one.
+        ("projected_saving", "INTEGER NOT NULL DEFAULT 0"),
     ];
     for (name, decl) in wanted {
         if !existing.iter().any(|c| c == name) {
             conn.execute(&format!("ALTER TABLE files ADD COLUMN {name} {decl}"), [])?;
         }
     }
+    // Created here rather than in `init_schema` because it needs a migrated column.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS files_state_saving
+         ON files(state, projected_saving DESC, size DESC);",
+    )?;
     Ok(())
 }
 
@@ -389,8 +405,12 @@ fn actor_loop(mut conn: Connection, mut rx: mpsc::Receiver<Cmd>) {
             Cmd::ListByState { state, reply } => {
                 let _ = reply.send(do_list_by_state(&conn, state));
             }
-            Cmd::ClaimNext { prefixes, reply } => {
-                let _ = reply.send(do_claim_next(&mut conn, &prefixes));
+            Cmd::ClaimNext {
+                prefixes,
+                order,
+                reply,
+            } => {
+                let _ = reply.send(do_claim_next(&mut conn, &prefixes, order));
             }
             Cmd::SetState {
                 path,
@@ -436,13 +456,14 @@ fn do_upsert(conn: &mut Connection, entries: &[Entry]) -> Result<usize> {
         // changed on the remote does it go back to pending for reassessment.
         let mut stmt = tx.prepare(
             r#"
-            INSERT INTO files (path, size, mod_time, blake3, state)
-            VALUES (?1, ?2, ?3, ?4, 'pending')
+            INSERT INTO files (path, size, mod_time, blake3, state, projected_saving)
+            VALUES (?1, ?2, ?3, ?4, 'pending', ?5)
             ON CONFLICT(path) DO UPDATE SET
                 size     = excluded.size,
                 mod_time = excluded.mod_time,
                 blake3   = excluded.blake3,
                 seen_at  = datetime('now'),
+                projected_saving = excluded.projected_saving,
                 state = CASE
                     WHEN files.size != excluded.size THEN 'pending'
                     ELSE files.state
@@ -459,6 +480,7 @@ fn do_upsert(conn: &mut Connection, entries: &[Entry]) -> Result<usize> {
                 entry.size as i64,
                 entry.mod_time,
                 entry.blake3,
+                crate::policy::projected_saving(&entry.path, entry.size) as i64,
             ])?;
             count += 1;
         }
@@ -545,12 +567,17 @@ fn do_list_by_state(conn: &Connection, state: State) -> Result<Vec<FileRow>> {
         .collect()
 }
 
-fn do_claim_next(conn: &mut Connection, prefixes: &[String]) -> Result<Option<FileRow>> {
+fn do_claim_next(
+    conn: &mut Connection,
+    prefixes: &[String],
+    order: Order,
+) -> Result<Option<FileRow>> {
     let tx = conn.transaction()?;
     let (filter, params) = prefix_filter(prefixes);
     let sql = format!(
         "SELECT path, size, mod_time, blake3, state, skip_reason
-         FROM files WHERE state = 'pending'{filter} ORDER BY size DESC, path LIMIT 1"
+         FROM files WHERE state = 'pending'{filter} ORDER BY {} LIMIT 1",
+        order_clause(order)
     );
     let raw = tx
         .query_row(
@@ -571,6 +598,21 @@ fn do_claim_next(conn: &mut Connection, prefixes: &[String]) -> Result<Option<Fi
     let mut row = build_row(raw)?;
     row.state = State::Claimed;
     Ok(Some(row))
+}
+
+/// The `ORDER BY` for one intake order.
+///
+/// Every variant ends in `path` so the sequence is total: two files of identical
+/// size must not swap places between runs, or `--limit` would cover a different
+/// set each time.
+fn order_clause(order: Order) -> &'static str {
+    match order {
+        // Projected saving first, but a tie falls back to size so a ledger that
+        // predates the column (all zeroes) still orders sensibly.
+        Order::Savings => "projected_saving DESC, size DESC, path",
+        Order::Size => "size DESC, path",
+        Order::Path => "path",
+    }
 }
 
 /// Builds a `path` restriction matching any of `prefixes`, plus its parameters.
@@ -815,10 +857,71 @@ mod tests {
             .upsert(vec![entry("small", 1), entry("big", 100), entry("mid", 50)])
             .await
             .unwrap();
-        assert_eq!(ledger.claim_next(&[]).await.unwrap().unwrap().path, "big");
-        assert_eq!(ledger.claim_next(&[]).await.unwrap().unwrap().path, "mid");
-        assert_eq!(ledger.claim_next(&[]).await.unwrap().unwrap().path, "small");
-        assert!(ledger.claim_next(&[]).await.unwrap().is_none());
+        assert_eq!(ledger.claim_next(&[], Order::Size).await.unwrap().unwrap().path, "big");
+        assert_eq!(ledger.claim_next(&[], Order::Size).await.unwrap().unwrap().path, "mid");
+        assert_eq!(ledger.claim_next(&[], Order::Size).await.unwrap().unwrap().path, "small");
+        assert!(ledger.claim_next(&[], Order::Size).await.unwrap().is_none());
+    }
+
+    /// `Order::Savings` is the default, and it is not the same as size order: a
+    /// large JPEG projects a 20% saving where a smaller PNG projects 35%, so the
+    /// smaller file can legitimately come first. This is the behaviour `--order`
+    /// was always documented to have and never actually had.
+    #[tokio::test]
+    async fn savings_order_is_not_size_order() {
+        let ledger = Ledger::open_in_memory().unwrap();
+        // jpeg -> jxl keeps 80% (saves 20%); png -> jxl keeps 65% (saves 35%).
+        // 100 * 0.20 = 20 against 70 * 0.35 = 24.5, so the PNG wins on savings
+        // while the JPEG wins on size.
+        ledger
+            .upsert(vec![entry("a.jpg", 100_000), entry("b.png", 70_000)])
+            .await
+            .unwrap();
+
+        let by_size = ledger.claim_next(&[], Order::Size).await.unwrap().unwrap();
+        assert_eq!(by_size.path, "a.jpg", "size order takes the bigger file");
+
+        let ledger = Ledger::open_in_memory().unwrap();
+        ledger
+            .upsert(vec![entry("a.jpg", 100_000), entry("b.png", 70_000)])
+            .await
+            .unwrap();
+        let by_savings = ledger
+            .claim_next(&[], Order::Savings)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(by_savings.path, "b.png", "savings order takes the better ratio");
+    }
+
+    #[tokio::test]
+    async fn path_order_is_lexicographic() {
+        let ledger = Ledger::open_in_memory().unwrap();
+        ledger
+            .upsert(vec![entry("c.jpg", 300), entry("a.jpg", 100), entry("b.jpg", 200)])
+            .await
+            .unwrap();
+        for expected in ["a.jpg", "b.jpg", "c.jpg"] {
+            let row = ledger.claim_next(&[], Order::Path).await.unwrap().unwrap();
+            assert_eq!(row.path, expected);
+        }
+    }
+
+    /// A file nothing can convert projects no saving, so it sorts last under
+    /// `Savings` rather than jumping the queue on size alone.
+    #[tokio::test]
+    async fn unconvertible_files_sort_last_by_savings() {
+        let ledger = Ledger::open_in_memory().unwrap();
+        ledger
+            .upsert(vec![entry("huge.bin", 9_000_000), entry("small.jpg", 50_000)])
+            .await
+            .unwrap();
+        let first = ledger
+            .claim_next(&[], Order::Savings)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.path, "small.jpg");
     }
 
     /// The whole point of the single-writer actor: concurrent claims cannot collide.
@@ -833,7 +936,7 @@ mod tests {
             let ledger = ledger.clone();
             handles.push(tokio::spawn(async move {
                 let mut mine = Vec::new();
-                while let Some(row) = ledger.claim_next(&[]).await.unwrap() {
+                while let Some(row) = ledger.claim_next(&[], Order::Size).await.unwrap() {
                     mine.push(row.path);
                 }
                 mine
@@ -868,7 +971,7 @@ mod tests {
 
         let scope = vec!["photos".to_string()];
         let mut claimed = Vec::new();
-        while let Some(row) = ledger.claim_next(&scope).await.unwrap() {
+        while let Some(row) = ledger.claim_next(&scope, Order::Size).await.unwrap() {
             claimed.push(row.path);
         }
         claimed.sort();
@@ -889,10 +992,10 @@ mod tests {
             .unwrap();
         let scope = vec!["photos".to_string()];
         assert_eq!(
-            ledger.claim_next(&scope).await.unwrap().unwrap().path,
+            ledger.claim_next(&scope, Order::Size).await.unwrap().unwrap().path,
             "photos/a.jpg"
         );
-        assert!(ledger.claim_next(&scope).await.unwrap().is_none());
+        assert!(ledger.claim_next(&scope, Order::Size).await.unwrap().is_none());
     }
 
     /// Folder names may contain LIKE wildcards; they must be matched literally.
@@ -905,10 +1008,10 @@ mod tests {
             .unwrap();
         let scope = vec!["100%_done".to_string()];
         assert_eq!(
-            ledger.claim_next(&scope).await.unwrap().unwrap().path,
+            ledger.claim_next(&scope, Order::Size).await.unwrap().unwrap().path,
             "100%_done/a.jpg"
         );
-        assert!(ledger.claim_next(&scope).await.unwrap().is_none());
+        assert!(ledger.claim_next(&scope, Order::Size).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -924,7 +1027,7 @@ mod tests {
             .unwrap();
         let scope = vec!["photos".to_string(), "camera".to_string()];
         let mut claimed = Vec::new();
-        while let Some(row) = ledger.claim_next(&scope).await.unwrap() {
+        while let Some(row) = ledger.claim_next(&scope, Order::Size).await.unwrap() {
             claimed.push(row.path);
         }
         assert_eq!(claimed, vec!["photos/a.jpg", "camera/b.jpg"]);
@@ -937,7 +1040,7 @@ mod tests {
             .upsert(vec![entry("a", 1), entry("b", 2)])
             .await
             .unwrap();
-        ledger.claim_next(&[]).await.unwrap();
+        ledger.claim_next(&[], Order::Size).await.unwrap();
         assert_eq!(ledger.counts().await.unwrap().claimed, 1);
 
         assert_eq!(ledger.recover_claimed().await.unwrap(), 1);
@@ -1138,6 +1241,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ledger.savings().await.unwrap().logical_bytes(), 1242);
+    }
+
+    /// A row that predates `projected_saving` reads as zero, so savings order must
+    /// still hand it out rather than skipping it or failing the query.
+    #[tokio::test]
+    async fn a_pre_savings_ledger_still_claims_in_savings_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE files (
+                    path TEXT PRIMARY KEY, size INTEGER NOT NULL, mod_time TEXT,
+                    blake3 TEXT, state TEXT NOT NULL DEFAULT 'pending',
+                    skip_reason TEXT, seen_at TEXT NOT NULL DEFAULT (datetime('now')));
+                 INSERT INTO files (path, size) VALUES ('old_small.jpg', 10_000);
+                 INSERT INTO files (path, size) VALUES ('old_big.jpg', 900_000);",
+            )
+            .unwrap();
+        }
+
+        let ledger = Ledger::open(&path).unwrap();
+        // Both migrated rows carry saving 0, so they fall through to the size
+        // tiebreaker; a freshly scanned row outranks them on its real estimate.
+        ledger.upsert(vec![entry("fresh.jpg", 500_000)]).await.unwrap();
+
+        let order: Vec<String> = {
+            let mut seen = Vec::new();
+            while let Some(row) = ledger.claim_next(&[], Order::Savings).await.unwrap() {
+                seen.push(row.path);
+            }
+            seen
+        };
+        assert_eq!(order, ["fresh.jpg", "old_big.jpg", "old_small.jpg"]);
     }
 
     #[tokio::test]

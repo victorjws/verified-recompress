@@ -18,6 +18,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::classify;
+use crate::config::Order;
 use crate::convert;
 use crate::governor::{self, Governor};
 use crate::ledger::{Conversion, FileRow, Ledger, State};
@@ -75,6 +76,10 @@ pub struct Options {
     pub limit: Option<usize>,
     /// Which files this run may touch.
     pub scope: Scope,
+    /// Sequence files are claimed in.
+    pub order: Order,
+    /// Duration floor for the AV1 tier, in seconds. Zero converts every length.
+    pub min_video_secs: f64,
     /// Encoder settings the video recipes need.
     pub video: convert::VideoOptions,
 }
@@ -126,7 +131,11 @@ impl<R: Remote + 'static> Pipeline<R> {
                 break;
             }
 
-            let Some(row) = self.ledger.claim_next(opts.scope.prefixes()).await? else {
+            let Some(row) = self
+                .ledger
+                .claim_next(opts.scope.prefixes(), opts.order)
+                .await?
+            else {
                 break;
             };
 
@@ -178,6 +187,7 @@ impl<R: Remote + 'static> Pipeline<R> {
         let limits = Limits {
             max_file_bytes: self.max_file_bytes,
             allow_video: opts.allow_video,
+            min_video_secs: opts.min_video_secs,
         };
 
         // Decide once on the cheap facts. Anything that needs the bytes is deferred

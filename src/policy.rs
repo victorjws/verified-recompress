@@ -15,8 +15,14 @@ use crate::classify::{Kind, MediaProbe, kind_from_extension};
 /// the original's exact bytes.
 pub const MIN_GAIN: f64 = 0.03;
 
-/// Videos shorter than this cost more in encode and verify overhead than they save.
-pub const MIN_VIDEO_SECS: f64 = 30.0;
+/// Default duration floor for the AV1 tier: none.
+///
+/// A short clip is not a worse candidate per byte — both the encode cost and the
+/// saving scale with its length. What does not scale is the per-file overhead:
+/// the round trips, the CRF search, and up to three full encodes each scored by
+/// decoding both files in full. Whether that trade is worth making is a
+/// judgement about the drive, so it is a setting rather than a constant.
+pub const DEFAULT_MIN_VIDEO_SECS: f64 = 0.0;
 
 /// Bits per pixel per second below which a video is already so compressed that
 /// re-encoding it at visually-lossless quality would not shrink it.
@@ -184,6 +190,41 @@ pub struct Limits {
     pub max_file_bytes: u64,
     /// Whether the irreversible AV1 tier is permitted.
     pub allow_video: bool,
+    /// Videos shorter than this are left alone. Zero means no floor.
+    pub min_video_secs: f64,
+}
+
+impl Limits {
+    /// The most permissive limits there are, used where the question is what a
+    /// file could yield rather than what this run will do.
+    pub fn unbounded() -> Self {
+        Self {
+            max_file_bytes: u64::MAX,
+            allow_video: true,
+            min_video_secs: 0.0,
+        }
+    }
+}
+
+/// Bytes a conversion would be expected to save, for ordering intake alone.
+///
+/// Deliberately independent of the run's settings: if the order changed with the
+/// flags, a run resumed with different ones would revisit files in a different
+/// sequence. It is also only as good as [`Recipe::expected_ratio`], which is a
+/// per-recipe rule of thumb rather than a measurement — good enough to sort by,
+/// not good enough to report.
+pub fn projected_saving(path: &str, size: u64) -> u64 {
+    let ratio = match decide(Facts::new(path, size), Limits::unbounded()) {
+        Decision::Convert(recipe) => recipe.expected_ratio(),
+        // A video cannot be judged without downloading it, so at intake time its
+        // saving is unknown. Guessing the AV1 ratio is right here and wrong in
+        // `report`: a projection shown to a person must not promise a saving
+        // nobody measured, but a sort key that treated every video as worthless
+        // would put the biggest wins on the drive dead last.
+        Decision::Skip(SkipReason::NeedsProbe) => Recipe::Av1.expected_ratio(),
+        Decision::Skip(_) => return 0,
+    };
+    size.saturating_sub((size as f64 * ratio) as u64)
 }
 
 /// Files below this are not worth a round trip.
@@ -317,7 +358,10 @@ fn decide_video(kind: Kind, probe: Option<&MediaProbe>, limits: Limits) -> Decis
             Decision::Skip(SkipReason::VideoAlreadyAv1)
         };
     }
-    if probe.duration_secs.is_some_and(|d| d < MIN_VIDEO_SECS) {
+    if probe
+        .duration_secs
+        .is_some_and(|d| d < limits.min_video_secs)
+    {
         return if kind == Kind::MpegTs {
             ts_fallback
         } else {
@@ -391,6 +435,7 @@ mod tests {
         Limits {
             max_file_bytes: 20 * 1024 * 1024 * 1024,
             allow_video: true,
+            min_video_secs: DEFAULT_MIN_VIDEO_SECS,
         }
     }
 
@@ -569,12 +614,52 @@ mod tests {
         );
     }
 
+    /// The floor is a setting, and its default is off: a short clip saves in
+    /// proportion to its length like any other, so excluding it is a judgement
+    /// about CPU time rather than a property of the file.
     #[test]
-    fn short_clips_are_not_worth_the_overhead() {
+    fn short_clips_convert_by_default() {
         let probe = video("h264", 1920, 1080, 12_000_000, 10.0);
+        assert_eq!(DEFAULT_MIN_VIDEO_SECS, 0.0);
         assert_eq!(
             decide(Facts::new("a.mp4", BIG).with_probe(&probe), limits()),
+            Decision::Convert(Recipe::Av1)
+        );
+    }
+
+    #[test]
+    fn a_configured_floor_skips_clips_under_it() {
+        let floor = Limits {
+            min_video_secs: 30.0,
+            ..limits()
+        };
+        let short = video("h264", 1920, 1080, 12_000_000, 10.0);
+        assert_eq!(
+            decide(Facts::new("a.mp4", BIG).with_probe(&short), floor),
             Decision::Skip(SkipReason::VideoTooShort)
+        );
+
+        // The boundary belongs to the longer side: exactly the floor passes.
+        let exact = video("h264", 1920, 1080, 12_000_000, 30.0);
+        assert_eq!(
+            decide(Facts::new("a.mp4", BIG).with_probe(&exact), floor),
+            Decision::Convert(Recipe::Av1)
+        );
+    }
+
+    /// A video whose duration ffprobe could not report must not be caught by the
+    /// floor; an unknown length is not a short one.
+    #[test]
+    fn an_unknown_duration_is_not_treated_as_short() {
+        let mut probe = video("h264", 1920, 1080, 12_000_000, 10.0);
+        probe.duration_secs = None;
+        let floor = Limits {
+            min_video_secs: 30.0,
+            ..limits()
+        };
+        assert_eq!(
+            decide(Facts::new("a.mp4", BIG).with_probe(&probe), floor),
+            Decision::Convert(Recipe::Av1)
         );
     }
 
@@ -659,7 +744,6 @@ mod tests {
                 p
             }),
             ("already av1", video("av1", 1920, 1080, 8_000_000, 120.0)),
-            ("too short", video("h264", 1920, 1080, 12_000_000, 5.0)),
             ("low bitrate", video("h264", 1920, 1080, 1_000_000, 120.0)),
         ];
         for (label, probe) in cases {
@@ -669,6 +753,18 @@ mod tests {
                 "{label}"
             );
         }
+
+        // The duration floor declines the same way, so it needs a run that sets one.
+        let floor = Limits {
+            min_video_secs: 30.0,
+            ..limits()
+        };
+        let short = video("h264", 1920, 1080, 12_000_000, 5.0);
+        assert_eq!(
+            decide(Facts::new("a.ts", BIG).with_probe(&short), floor),
+            Decision::Convert(Recipe::TsRemux),
+            "too short"
+        );
     }
 
     #[test]
@@ -693,12 +789,49 @@ mod tests {
     fn oversized_files_are_skipped() {
         let limits = Limits {
             max_file_bytes: 1024,
-            allow_video: true,
+            ..limits()
         };
         assert_eq!(
             decide(Facts::new("a.jpg", 10 * 1024), limits),
             Decision::Skip(SkipReason::TooLargeForBudget)
         );
+    }
+
+    /// Ordering must not depend on how the run was configured, or a run resumed
+    /// with different flags would revisit files in a different sequence.
+    #[test]
+    fn projected_saving_ignores_run_settings() {
+        // Far past any plausible max_file_bytes, and video, which needs a flag.
+        let huge = 500u64 * 1024 * 1024 * 1024;
+        assert!(projected_saving("a.jpg", huge) > 0);
+        assert!(projected_saving("a.mkv", huge) > 0);
+    }
+
+    /// Video is where the space is. It cannot be judged without a probe, so the
+    /// sort key falls back to the AV1 ratio rather than ranking it at zero.
+    #[test]
+    fn video_is_ranked_on_the_av1_ratio_not_at_zero() {
+        let size = 1_000_000;
+        assert_eq!(
+            decide(Facts::new("a.mkv", size), Limits::unbounded()),
+            Decision::Skip(SkipReason::NeedsProbe),
+            "a video with no probe cannot be judged"
+        );
+        assert_eq!(projected_saving("a.mkv", size), 300_000);
+        assert!(
+            projected_saving("a.mkv", size) > projected_saving("a.jpg", size),
+            "a video must outrank an image of the same size"
+        );
+    }
+
+    #[test]
+    fn projected_saving_follows_the_recipe_ratio() {
+        // jpeg -> jxl keeps 80%, png -> jxl keeps 65%.
+        assert_eq!(projected_saving("a.jpg", 100_000), 20_000);
+        assert_eq!(projected_saving("a.png", 100_000), 35_000);
+        // Nothing to do, nothing projected.
+        assert_eq!(projected_saving("a.bin", 100_000), 0);
+        assert_eq!(projected_saving("a.jpg", 100), 0, "below the useful floor");
     }
 
     #[test]

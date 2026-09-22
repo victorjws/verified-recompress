@@ -194,6 +194,7 @@ nothing to the remote.
 | `--api-concurrency N` | concurrent lightweight remote API calls (default 4) |
 | `--video-reserve-cores N` | cores video encoding leaves free so image jobs keep flowing (default 2) |
 | `--order savings\|size\|path` | order files are picked up in (default `savings`) |
+| `--min-video-secs SECONDS` | leave videos shorter than this alone (default `0`, meaning convert every length) |
 | `--preset N` | SVT-AV1 preset. Lower is smaller and slower |
 | `--allow-discard-corrupt` | let ffmpeg drop corrupt MPEG-TS packets. **This makes the remux lossy** |
 | `--trash-policy keep\|purge-after-days\|purge-now` | when to empty the trash (default `keep`) |
@@ -259,6 +260,7 @@ api_concurrency = 4
 cpu_permits = 0
 video_reserve_cores = 2
 order = "savings"
+min_video_secs = 0
 paths = ["/Photos/2019", "/Camera"]
 exclude = ["**/.thumbnails/**"]
 trash_policy = "keep"
@@ -277,7 +279,8 @@ purge_after_days = 30
 | `api_concurrency` | 4 | must be at least 1 |
 | `cpu_permits` | detected core count | `0` means detect |
 | `video_reserve_cores` | 2 | must be less than `cpu_permits` |
-| `order` | `savings` | `savings`, `size`, or `path` |
+| `order` | `savings` | `savings`, `size`, or `path`. `savings` ranks by projected saving, so a small file with a good ratio outranks a large one that converts poorly |
+| `min_video_secs` | `0` | duration floor for the AV1 tier. `0` converts every length |
 | `paths` | whole remote | CLI `--path` replaces this list entirely |
 | `exclude` | none | CLI `--exclude` is appended to this list |
 | `trash_policy` | `keep` | `keep`, `purge_after_days`, or `purge_now` |
@@ -313,7 +316,7 @@ drive still full" is answerable from `plan` and `report`.
 | `video_hdr` | HDR10, HLG or Dolby Vision; re-encoding loses the mastering metadata |
 | `video_already_av1` | another pass would only stack generation loss |
 | `video_low_bitrate` | already below 1.0 bits/pixel/second (roughly 1080p at 2 Mbps, 4K at 8 Mbps) |
-| `video_too_short` | under 30 seconds; encode and verify overhead exceeds the saving |
+| `video_too_short` | shorter than `min_video_secs`; off by default |
 | `video_complex_structure` | multiple video streams or attachments a straight re-encode would mangle |
 | `video_tier_disabled` | needs `--allow-video` |
 | `needs_probe` | a video that `plan` cannot judge without downloading it |
@@ -353,7 +356,7 @@ Other things worth knowing:
 ## Development
 
 ```sh
-cargo test          # 289 tests
+cargo test          # 298 tests
 cargo build --release
 ```
 

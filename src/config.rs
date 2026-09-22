@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+use crate::policy::DEFAULT_MIN_VIDEO_SECS;
+
 /// Fraction of free space used when no explicit budget is given.
 const DEFAULT_BUDGET_FRACTION: f64 = 0.70;
 const DEFAULT_CLOUD_RESERVE_GB: u64 = 5;
@@ -55,6 +57,7 @@ pub struct FileConfig {
     pub cpu_permits: Option<usize>,
     pub video_reserve_cores: Option<usize>,
     pub order: Option<Order>,
+    pub min_video_secs: Option<f64>,
     pub paths: Option<Vec<String>>,
     pub exclude: Option<Vec<String>>,
     pub trash_policy: Option<TrashPolicy>,
@@ -92,6 +95,7 @@ pub struct Overrides {
     pub cpu_permits: Option<usize>,
     pub video_reserve_cores: Option<usize>,
     pub order: Option<Order>,
+    pub min_video_secs: Option<f64>,
     /// Replaces the file's `paths` entirely when non-empty.
     pub paths: Vec<String>,
     /// Appended to the file's `exclude`.
@@ -101,7 +105,7 @@ pub struct Overrides {
 }
 
 /// Fully resolved, validated configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub remote: String,
     pub staging_dir: PathBuf,
@@ -114,6 +118,8 @@ pub struct Config {
     pub cpu_permits: usize,
     pub video_reserve_cores: usize,
     pub order: Order,
+    /// Duration floor for the AV1 tier, in seconds. Zero means no floor.
+    pub min_video_secs: f64,
     pub paths: Vec<String>,
     pub exclude: Vec<String>,
     pub trash_policy: TrashPolicy,
@@ -137,6 +143,14 @@ impl Config {
             .staging_dir
             .or(file.staging_dir)
             .unwrap_or_else(default_staging_dir);
+
+        let min_video_secs = ov
+            .min_video_secs
+            .or(file.min_video_secs)
+            .unwrap_or(DEFAULT_MIN_VIDEO_SECS);
+        if !min_video_secs.is_finite() || min_video_secs < 0.0 {
+            bail!("min_video_secs = {min_video_secs} must be zero or a positive number of seconds");
+        }
 
         let budget_gb = ov.staging_budget_gb.or(file.staging_budget_gb);
         let staging_budget_mib = match budget_gb {
@@ -255,6 +269,7 @@ impl Config {
             cpu_permits,
             video_reserve_cores,
             order: ov.order.or(file.order).unwrap_or(Order::Savings),
+            min_video_secs,
             paths,
             exclude,
             trash_policy: ov

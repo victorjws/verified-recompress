@@ -146,6 +146,10 @@ pub struct RunArgs {
     #[arg(long, value_enum)]
     pub order: Option<Order>,
 
+    /// Leave videos shorter than this alone. 0 converts them all.
+    #[arg(long, value_name = "SECONDS")]
+    pub min_video_secs: Option<f64>,
+
     /// SVT-AV1 preset. Lower is smaller and slower.
     #[arg(long, value_name = "N")]
     pub preset: Option<u8>,
@@ -184,6 +188,7 @@ impl Cli {
             ov.cpu_permits = args.cpu_permits;
             ov.video_reserve_cores = args.video_reserve_cores;
             ov.order = args.order;
+            ov.min_video_secs = args.min_video_secs;
             ov.trash_policy = args.trash_policy;
             ov.purge_after_days = args.purge_after_days;
         }

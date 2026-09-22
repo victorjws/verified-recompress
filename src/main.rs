@@ -158,6 +158,7 @@ async fn run_plan(cfg: &Config) -> Result<()> {
         // `plan` reports what the lossless tiers alone would do; the AV1 tier needs
         // both a probe and --allow-video, so including it here would overpromise.
         allow_video: false,
+        min_video_secs: cfg.min_video_secs,
     };
 
     let mut projection = Projection::default();
@@ -189,6 +190,9 @@ async fn run_convert(cfg: &Config, args: &RunArgs) -> Result<()> {
     // --allow-video would silently do nothing to files it had already excluded.
     let mut reopen: Vec<&str> = vec![
         SkipReason::TooLargeForBudget.as_str(),
+        // The duration floor is a setting too, so a run that lowers it has to
+        // reconsider what an earlier, stricter one passed over.
+        SkipReason::VideoTooShort.as_str(),
         pipeline::OUT_OF_SCOPE,
     ];
     if args.allow_video {
@@ -244,6 +248,8 @@ async fn run_convert(cfg: &Config, args: &RunArgs) -> Result<()> {
             allow_video: args.allow_video,
             limit: args.limit,
             scope: Scope::new(&cfg.paths, &cfg.exclude)?,
+            order: cfg.order,
+            min_video_secs: cfg.min_video_secs,
             video: convert::VideoOptions {
                 preset: args.preset,
                 temporal_filtering_off: false,
