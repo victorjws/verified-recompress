@@ -43,7 +43,12 @@ pub enum Command {
     Preflight,
 
     /// Build the remote inventory into the ledger. Downloads nothing.
-    Scan,
+    Scan {
+        /// Also record each file's blake3. `dedup` needs it; on Filen it makes
+        /// the listing dramatically slower, so it is off by default.
+        #[arg(long)]
+        hash: bool,
+    },
 
     /// Assign recipes and report projected savings. Read-only.
     Plan,

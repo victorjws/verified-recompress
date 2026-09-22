@@ -153,6 +153,10 @@ pub struct Conversion {
     pub output_size: u64,
     pub recipe: String,
     pub fidelity: String,
+    /// blake3 of the original, computed locally from the bytes that were
+    /// converted. A listing may or may not have carried one; this is what a
+    /// restore is checked against, so it is taken where it can be trusted.
+    pub original_blake3: String,
 }
 
 /// Originals sitting in the trash, still counted against the quota.
@@ -692,6 +696,7 @@ fn do_record_conversion(conn: &Connection, record: &Conversion) -> Result<()> {
             output_size = ?3,
             recipe      = ?4,
             fidelity    = ?5,
+            blake3      = ?6,
             trashed_at  = datetime('now'),
             reclaimed   = 0
          WHERE path = ?1",
@@ -701,6 +706,7 @@ fn do_record_conversion(conn: &Connection, record: &Conversion) -> Result<()> {
             record.output_size as i64,
             record.recipe,
             record.fidelity,
+            record.original_blake3,
         ],
     )?;
     if changed == 0 {
@@ -1151,6 +1157,7 @@ mod tests {
             output_size,
             recipe: "jxl-from-jpeg".into(),
             fidelity: "byte-exact".into(),
+            original_blake3: format!("hash-of-{path}"),
         }
     }
 

@@ -22,7 +22,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::process::{Child, Command};
 
-use super::{About, Entry, HASH_TYPE, Remote, parse_about, parse_entries, remote_spec};
+use super::{About, Entry, HASH_TYPE, Hashes, Remote, parse_about, parse_entries, remote_spec};
 
 /// How long to wait for the daemon's listener to come up.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
@@ -283,16 +283,20 @@ impl RcdRemote {
     ///
     /// The consequence is that returned paths are relative to the scope and have
     /// to be prefixed back to remote-root-relative; see [`Self::list_progress`].
-    fn list_request(&self, scope: &str) -> Value {
+    fn list_request(&self, scope: &str, hashes: Hashes) -> Value {
+        let mut opt = json!({ "recurse": true, "filesOnly": true });
+        if hashes.wanted() {
+            // Both fields, and only when wanted: `hashTypes` on its own turns
+            // hashing on even with `showHash` explicitly false, so leaving it in
+            // as a harmless default would quietly undo the whole point of
+            // `Hashes::Skip`. Verified against rclone 1.75.1.
+            opt["showHash"] = Value::Bool(true);
+            opt["hashTypes"] = json!([HASH_TYPE]);
+        }
         json!({
             "fs": remote_spec(&self.remote, scope),
             "remote": "",
-            "opt": {
-                "recurse": true,
-                "filesOnly": true,
-                "showHash": true,
-                "hashTypes": [HASH_TYPE],
-            }
+            "opt": opt,
         })
     }
 
@@ -306,10 +310,11 @@ impl RcdRemote {
     pub async fn list_progress(
         &self,
         scope: &str,
+        hashes: Hashes,
         on_tick: impl FnMut(&JobStats) + Send,
     ) -> Result<Vec<Entry>> {
         let jobid = self
-            .call_async("operations/list", self.list_request(scope))
+            .call_async("operations/list", self.list_request(scope, hashes))
             .await?;
         let output = self.await_job("operations/list", jobid, on_tick).await?;
         let list = output
@@ -386,8 +391,8 @@ struct HashResponse {
 impl Remote for RcdRemote {
     /// Delegates to [`RcdRemote::list_progress`] rather than repeating it, so the
     /// parity suite exercises the path the CLI actually runs.
-    fn list(&self, scope: &str) -> impl Future<Output = Result<Vec<Entry>>> + Send {
-        self.list_progress(scope, |_| {})
+    fn list(&self, scope: &str, hashes: Hashes) -> impl Future<Output = Result<Vec<Entry>>> + Send {
+        self.list_progress(scope, hashes, |_| {})
     }
 
     fn download(&self, path: &str, local: &Path) -> impl Future<Output = Result<()>> + Send {
@@ -766,14 +771,23 @@ mod tests {
             http: reqwest::Client::new(),
             child: None,
         };
-        let body = remote.list_request("/Photos/2019/");
+        let body = remote.list_request("/Photos/2019/", Hashes::Skip);
         assert_eq!(body["fs"], "filen:Photos/2019");
         assert_eq!(body["remote"], "");
         assert_eq!(body["opt"]["recurse"], true);
-        assert_eq!(body["opt"]["hashTypes"][0], HASH_TYPE);
+
+        // Hashes are what made this call slow on Filen, so the default must be
+        // off. Both fields have to be absent, not merely false: rclone turns
+        // hashing on for a bare `hashTypes` no matter what `showHash` says.
+        assert!(body["opt"].get("showHash").is_none(), "{body}");
+        assert!(body["opt"].get("hashTypes").is_none(), "{body}");
+
+        let hashed = remote.list_request("/Photos/2019/", Hashes::Include);
+        assert_eq!(hashed["opt"]["showHash"], true);
+        assert_eq!(hashed["opt"]["hashTypes"][0], HASH_TYPE);
 
         // An empty scope is the whole drive, and must not become "filen:/".
-        let all = remote.list_request("");
+        let all = remote.list_request("", Hashes::Skip);
         assert_eq!(all["fs"], "filen:");
         assert_eq!(all["remote"], "");
     }

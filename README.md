@@ -150,10 +150,16 @@ Global flags work with every subcommand:
 Checks that every external tool exists and supports the flags used. Exits non-zero on any error
 finding; warnings (such as a missing `taskset` off Linux) do not fail it.
 
-### `scan`
+### `scan [--hash]`
 
 Lists the remote and records every file in the ledger. Downloads nothing, modifies nothing. Run it
 again whenever the drive changes.
+
+It does **not** record content hashes by default. Asking rclone for them turns a Filen listing
+from seconds into minutes, and nothing in the conversion path needs them: a conversion hashes the
+original itself once the bytes are local, which is a stronger guarantee than taking the backend's
+word for it. Only [`dedup`](#dedup) wants them, so pass `--hash` when that is what you are after.
+`dedup` says so rather than reporting "no duplicates" when the inventory was never hashed.
 
 One recursive request covers a whole scope, so a large drive can spend minutes inside a single
 call. A counter runs while it does, which is how you tell a slow listing from a stuck one:
@@ -247,7 +253,11 @@ defaults to `keep`.
 
 ### `dedup`
 
-Reports files stored more than once, from the inventory alone. Read-only; deletes nothing.
+Reports files stored more than once, matched on blake3 and size, from the inventory alone.
+Read-only; deletes nothing.
+
+Needs an inventory built with `scan --hash`. Without one it says how many files it could not
+compare, rather than reporting that there are no duplicates.
 
 ### `cleanup [--execute]`
 
@@ -373,7 +383,7 @@ Other things worth knowing:
 ## Development
 
 ```sh
-cargo test          # 307 tests
+cargo test          # 311 tests
 cargo build --release
 ```
 

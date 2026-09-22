@@ -217,6 +217,12 @@ impl<R: Remote + 'static> Pipeline<R> {
             self.remote.download(&row.path, &input).await?;
         }
 
+        // Hash the original now, while it is certainly still on disk: some
+        // recipes delete it before verification. This is what a restore is
+        // checked against, and taking it from the bytes that were actually
+        // converted beats trusting whatever a listing reported.
+        let original_hash = crate::hash::blake3_file(&input).await?;
+
         // Now that the bytes are here, settle the decision properly.
         let head = read_head(&input).await?;
         let probe = if classify::kind_from_extension(&row.path).is_video()
@@ -373,6 +379,7 @@ impl<R: Remote + 'static> Pipeline<R> {
                 output_size: output_bytes,
                 recipe: recipe.as_str().to_string(),
                 fidelity: fidelity.as_str().to_string(),
+                original_blake3: original_hash,
             })
             .await?;
 

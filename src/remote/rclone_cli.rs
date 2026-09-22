@@ -9,7 +9,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use tokio::process::Command;
 
-use super::{About, Entry, HASH_TYPE, Remote, parse_about, parse_entries, remote_spec};
+use super::{About, Entry, HASH_TYPE, Hashes, Remote, parse_about, parse_entries, remote_spec};
 
 pub struct CliRemote {
     remote: String,
@@ -84,24 +84,24 @@ fn is_not_found(code: i32) -> bool {
 }
 
 impl Remote for CliRemote {
-    fn list(&self, scope: &str) -> impl Future<Output = Result<Vec<Entry>>> + Send {
+    fn list(&self, scope: &str, hashes: Hashes) -> impl Future<Output = Result<Vec<Entry>>> + Send {
         let spec = remote_spec(&self.remote, scope);
         let scope = scope.to_string();
         async move {
-            let json = self
-                .run(&[
-                    "lsjson",
-                    "--recursive",
-                    "--files-only",
-                    // Narrow the hash set explicitly; a bare --hash makes some backends
-                    // compute every algorithm they support.
-                    "--hash-type",
-                    HASH_TYPE,
-                    // Filen supports ListR, so one recursive call beats per-directory walks.
-                    "--fast-list",
-                    &spec,
-                ])
-                .await?;
+            let mut args = vec![
+                "lsjson",
+                "--recursive",
+                "--files-only",
+                // Filen supports ListR, so one recursive call beats per-directory walks.
+                "--fast-list",
+            ];
+            if hashes.wanted() {
+                // Narrow the hash set explicitly; a bare --hash makes some backends
+                // compute every algorithm they support.
+                args.extend(["--hash-type", HASH_TYPE]);
+            }
+            args.push(&spec);
+            let json = self.run(&args).await?;
             parse_entries(&json, &scope)
         }
     }

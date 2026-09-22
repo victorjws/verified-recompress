@@ -14,7 +14,7 @@ use std::process::Command;
 use verified_recompress::ledger::{Ledger, State};
 use verified_recompress::remote::rclone_cli::CliRemote;
 use verified_recompress::remote::rcd::RcdRemote;
-use verified_recompress::remote::{Entry, Remote};
+use verified_recompress::remote::{Entry, Hashes, Remote};
 
 /// Skips the test (rather than failing) when rclone is absent, so `cargo test`
 /// still works on a machine that has not been set up yet.
@@ -93,7 +93,7 @@ fn sorted(mut entries: Vec<Entry>) -> Vec<Entry> {
 async fn cli_lists_the_tree() {
     require_rclone!();
     let fx = Fixture::new();
-    let entries = sorted(fx.cli().list("").await.unwrap());
+    let entries = sorted(fx.cli().list("", Hashes::Skip).await.unwrap());
 
     assert_eq!(entries.len(), 3, "directories must not appear: {entries:#?}");
     assert_eq!(entries[0].path, "a.txt");
@@ -102,8 +102,8 @@ async fn cli_lists_the_tree() {
     assert_eq!(entries[2].path, "sub/c.bin");
     assert_eq!(entries[2].size, 1024);
     assert!(
-        entries.iter().all(|e| e.blake3.is_some()),
-        "every entry should carry a blake3 hash"
+        entries.iter().all(|e| e.blake3.is_none()),
+        "a plain listing must not carry hashes"
     );
 }
 
@@ -111,7 +111,7 @@ async fn cli_lists_the_tree() {
 async fn listing_a_subtree_yields_root_relative_paths() {
     require_rclone!();
     let fx = Fixture::new();
-    let entries = sorted(fx.cli().list("sub").await.unwrap());
+    let entries = sorted(fx.cli().list("sub", Hashes::Skip).await.unwrap());
     assert_eq!(entries.len(), 2);
     // Not "b.txt": the ledger keys on remote-root-relative paths, so scanning a
     // subtree must produce the same key as scanning the whole drive.
@@ -125,12 +125,12 @@ async fn both_implementations_list_identically() {
     let fx = Fixture::new();
     let rcd = fx.rcd().await;
 
-    let from_cli = sorted(fx.cli().list("").await.unwrap());
-    let from_rcd = sorted(rcd.list("").await.unwrap());
+    let from_cli = sorted(fx.cli().list("", Hashes::Skip).await.unwrap());
+    let from_rcd = sorted(rcd.list("", Hashes::Skip).await.unwrap());
     assert_eq!(from_cli, from_rcd);
 
-    let from_cli = sorted(fx.cli().list("sub").await.unwrap());
-    let from_rcd = sorted(rcd.list("sub").await.unwrap());
+    let from_cli = sorted(fx.cli().list("sub", Hashes::Skip).await.unwrap());
+    let from_rcd = sorted(rcd.list("sub", Hashes::Skip).await.unwrap());
     assert_eq!(from_cli, from_rcd);
 
     rcd.shutdown().await.unwrap();
@@ -177,7 +177,7 @@ async fn a_bad_remote_is_an_error_not_an_absence() {
         broken.stat("a.txt").await.is_err(),
         "an unusable remote must not be reported as a missing file"
     );
-    assert!(broken.list("").await.is_err());
+    assert!(broken.list("", Hashes::Skip).await.is_err());
 }
 
 #[tokio::test]
@@ -186,7 +186,14 @@ async fn hashsum_matches_the_listed_hash() {
     let fx = Fixture::new();
     let rcd = fx.rcd().await;
 
-    let listed = sorted(rcd.list("").await.unwrap());
+    // A plain listing leaves hashes out; that is what keeps `scan` quick.
+    let plain = sorted(rcd.list("", Hashes::Skip).await.unwrap());
+    assert!(
+        plain.iter().all(|e| e.blake3.is_none()),
+        "a default listing must not pay for hashes"
+    );
+
+    let listed = sorted(rcd.list("", Hashes::Include).await.unwrap());
     let a = listed.iter().find(|e| e.path == "a.txt").unwrap();
 
     assert_eq!(rcd.hashsum("a.txt").await.unwrap(), a.blake3);
@@ -210,6 +217,24 @@ async fn about_reports_quota() {
     assert!(about.free.unwrap_or(0) > 0);
 }
 
+/// Both settings have to agree, not just the default one.
+#[tokio::test]
+async fn both_implementations_agree_with_hashes_too() {
+    require_rclone!();
+    let fx = Fixture::new();
+    let rcd = fx.rcd().await;
+
+    let from_cli = sorted(fx.cli().list("", Hashes::Include).await.unwrap());
+    let from_rcd = sorted(rcd.list("", Hashes::Include).await.unwrap());
+    assert_eq!(from_cli, from_rcd);
+    assert!(
+        from_cli.iter().all(|e| e.blake3.is_some()),
+        "asking for hashes has to produce them"
+    );
+
+    rcd.shutdown().await.unwrap();
+}
+
 /// The whole point of `scan`: a listing lands in the ledger and survives a rescan.
 #[tokio::test]
 async fn listing_feeds_the_ledger_and_rescanning_is_idempotent() {
@@ -217,7 +242,7 @@ async fn listing_feeds_the_ledger_and_rescanning_is_idempotent() {
     let fx = Fixture::new();
     let ledger = Ledger::open_in_memory().unwrap();
 
-    let entries = fx.cli().list("").await.unwrap();
+    let entries = fx.cli().list("", Hashes::Skip).await.unwrap();
     assert_eq!(ledger.upsert(entries.clone()).await.unwrap(), 3);
     assert_eq!(ledger.counts().await.unwrap().pending, 3);
 

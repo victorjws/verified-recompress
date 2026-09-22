@@ -25,6 +25,28 @@ use serde::Deserialize;
 /// rclone knows, which is needlessly slow.
 pub const HASH_TYPE: &str = "blake3";
 
+/// Whether a listing should ask the backend for content hashes.
+///
+/// Measured against a Filen folder: the same listing takes over a minute with
+/// hashes and a few seconds without, so they are opt-in. Only [`dedup`] needs
+/// them; a conversion hashes the original itself once the bytes are local,
+/// which is a stronger guarantee than taking the backend's word for it.
+///
+/// [`dedup`]: crate::dedup
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hashes {
+    /// Leave [`Entry::blake3`] empty. The default, and what `scan` uses.
+    Skip,
+    /// Ask for blake3 per file. Slow on Filen; `scan --hash` opts in.
+    Include,
+}
+
+impl Hashes {
+    fn wanted(self) -> bool {
+        self == Hashes::Include
+    }
+}
+
 /// One file on the remote. Directories are filtered out during listing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
@@ -33,6 +55,7 @@ pub struct Entry {
     pub size: u64,
     /// RFC3339, as reported by the backend.
     pub mod_time: Option<String>,
+    /// Only present when the listing asked for it; see [`Hashes`].
     pub blake3: Option<String>,
 }
 
@@ -48,7 +71,11 @@ pub struct About {
 pub trait Remote: Send + Sync {
     /// Recursively lists files under `scope`, a path relative to the remote root.
     /// Returned paths are also relative to the remote root, not to `scope`.
-    fn list(&self, scope: &str) -> impl Future<Output = Result<Vec<Entry>>> + Send;
+    ///
+    /// [`Entry::blake3`] is only filled in when `hashes` asks for it. Use
+    /// [`Remote::hashsum`] for one file rather than listing the world.
+    fn list(&self, scope: &str, hashes: Hashes)
+    -> impl Future<Output = Result<Vec<Entry>>> + Send;
 
     /// Fetches one file to a local path.
     fn download(&self, path: &str, local: &Path) -> impl Future<Output = Result<()>> + Send;

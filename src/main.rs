@@ -17,7 +17,8 @@ use verified_recompress::pipeline::{self, Pipeline};
 use verified_recompress::policy::{self, Limits, SkipReason};
 use verified_recompress::preflight;
 use verified_recompress::progress;
-use verified_recompress::remote::{Remote, rcd::RcdRemote};
+use verified_recompress::remote::{Hashes, Remote, rcd::RcdRemote};
+use verified_recompress::remote::rcd::JobStats;
 use verified_recompress::dedup;
 use verified_recompress::report::Projection;
 use verified_recompress::restore;
@@ -66,7 +67,7 @@ async fn main() -> Result<()> {
 
     match &cli.command {
         Command::Preflight => run_preflight(&cfg).await,
-        Command::Scan => run_scan(&cfg).await,
+        Command::Scan { hash } => run_scan(&cfg, *hash).await,
         Command::Run(args) => {
             // Guardrail: a whole-drive write must be asked for explicitly.
             if args.execute && cfg.paths.is_empty() && !args.all {
@@ -88,7 +89,7 @@ async fn main() -> Result<()> {
 }
 
 /// Builds the inventory. Reads only: nothing is downloaded and nothing is modified.
-async fn run_scan(cfg: &Config) -> Result<()> {
+async fn run_scan(cfg: &Config, hash: bool) -> Result<()> {
     let ledger = Ledger::open(&cfg.staging_dir.join("ledger.sqlite"))?;
     let recovered = ledger.recover_claimed().await?;
     if recovered > 0 {
@@ -121,8 +122,9 @@ async fn run_scan(cfg: &Config) -> Result<()> {
         // One recursive request covers the whole subtree, so without a counter
         // there is nothing between "listing" and the result but silence.
         let activity = progress::Activity::start(format!("listing {label}"));
+        let hashes = if hash { Hashes::Include } else { Hashes::Skip };
         let entries = remote
-            .list_progress(scope, |stats| {
+            .list_progress(scope, hashes, |stats: &JobStats| {
                 activity.set(format!(
                     "listed {} entries",
                     progress::thousands(stats.listed)

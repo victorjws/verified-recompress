@@ -34,6 +34,13 @@ impl Group {
 pub struct Report {
     /// Groups, largest recoverable first.
     pub groups: Vec<Group>,
+    /// Files the inventory holds no hash for, so they could not be compared.
+    ///
+    /// `scan` does not record hashes unless asked, because on Filen that makes
+    /// the listing far slower. Reporting "no duplicates" when the truth is "we
+    /// never looked" would be the worst answer available, so the count is kept
+    /// and shown.
+    pub unhashed: usize,
 }
 
 impl Report {
@@ -52,16 +59,18 @@ impl Report {
 /// sizes are not equal contents.
 pub fn find(rows: &[FileRow]) -> Report {
     let mut by_hash: HashMap<(&str, u64), Vec<&str>> = HashMap::new();
+    let mut unhashed = 0usize;
     for row in rows {
         // A zero-length file is not an interesting duplicate.
         if row.size == 0 {
             continue;
         }
-        if let Some(hash) = row.blake3.as_deref() {
-            by_hash
+        match row.blake3.as_deref() {
+            Some(hash) => by_hash
                 .entry((hash, row.size))
                 .or_default()
-                .push(&row.path);
+                .push(&row.path),
+            None => unhashed += 1,
         }
     }
 
@@ -84,13 +93,30 @@ pub fn find(rows: &[FileRow]) -> Report {
             .cmp(&a.recoverable())
             .then_with(|| a.paths[0].cmp(&b.paths[0]))
     });
-    Report { groups }
+    Report { groups, unhashed }
+}
+
+impl Report {
+    /// Says how much of the inventory could not be compared at all.
+    fn note_unhashed(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.unhashed == 0 {
+            return Ok(());
+        }
+        writeln!(
+            f,
+            "\n  {} file(s) have no recorded hash and were not compared.\n  \
+             Re-run `scan --hash` to record them; it is slower, which is why it \n  \
+             is not the default.",
+            self.unhashed
+        )
+    }
 }
 
 impl fmt::Display for Report {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.groups.is_empty() {
-            return writeln!(f, "No duplicate files found.");
+            writeln!(f, "No duplicate files found.")?;
+            return self.note_unhashed(f);
         }
         writeln!(
             f,
@@ -115,7 +141,8 @@ impl fmt::Display for Report {
             f,
             "\n  Nothing has been deleted. Which copy to keep depends on what you\n  \
              meant by having both, so that decision is left to you."
-        )
+        )?;
+        self.note_unhashed(f)
     }
 }
 
@@ -191,6 +218,44 @@ mod tests {
         assert!(report.groups.is_empty());
         assert_eq!(report.recoverable(), 0);
         assert!(report.to_string().contains("No duplicate files"));
+    }
+
+    /// An inventory with no hashes cannot find duplicates, and saying "none
+    /// found" would read as "there are none". It has to say it did not look.
+    #[test]
+    fn an_unhashed_inventory_says_so_rather_than_reporting_nothing() {
+        let rows = vec![row("a", 10, None), row("b", 10, None)];
+        let report = find(&rows);
+        assert!(report.groups.is_empty());
+        assert_eq!(report.unhashed, 2);
+
+        let text = report.to_string();
+        assert!(text.contains("no recorded hash"), "{text}");
+        assert!(text.contains("scan --hash"), "{text}");
+    }
+
+    /// The note also belongs on a report that did find something: a partial
+    /// answer presented as a complete one is the same mistake.
+    #[test]
+    fn the_note_appears_alongside_real_findings_too() {
+        let rows = vec![
+            row("a", 10, Some("aa")),
+            row("b", 10, Some("aa")),
+            row("c", 99, None),
+        ];
+        let report = find(&rows);
+        assert_eq!(report.groups.len(), 1);
+        assert_eq!(report.unhashed, 1);
+        assert!(report.to_string().contains("no recorded hash"));
+    }
+
+    /// A fully hashed inventory must not carry the caveat.
+    #[test]
+    fn a_hashed_inventory_carries_no_note() {
+        let rows = vec![row("a", 10, Some("aa")), row("b", 10, Some("aa"))];
+        let report = find(&rows);
+        assert_eq!(report.unhashed, 0);
+        assert!(!report.to_string().contains("no recorded hash"));
     }
 
     /// Output has to be stable so two runs can be compared.
