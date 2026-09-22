@@ -85,6 +85,7 @@ pub struct Options {
 }
 
 pub struct Pipeline<R: Remote + 'static> {
+    board: Arc<crate::progress::Board>,
     remote: Arc<R>,
     ledger: Ledger,
     governor: Arc<Governor>,
@@ -104,6 +105,7 @@ impl<R: Remote + 'static> Pipeline<R> {
         cancel: CancellationToken,
     ) -> Self {
         Self {
+            board: Arc::new(crate::progress::Board::start(None)),
             remote,
             ledger,
             governor,
@@ -153,18 +155,44 @@ impl<R: Remote + 'static> Pipeline<R> {
             let this = Arc::clone(&self);
             let opts = Arc::clone(&opts);
             tasks.spawn(async move { this.process(row, &opts).await });
+            // Claiming changes the denominator, so the summary is restated here
+            // as well as on completion; otherwise it reads 0/0 until the first
+            // file lands, which on a long video is a very long time.
+            self.show(&summary, started);
 
             // Keep the in-flight set from growing without bound while the disk
             // budget is the real limiter; drain whatever has already finished.
             while let Some(done) = tasks.try_join_next() {
                 summary.merge(done.unwrap_or(Outcome::Failed));
+                self.show(&summary, started);
             }
         }
 
         while let Some(done) = tasks.join_next().await {
             summary.merge(done.unwrap_or(Outcome::Failed));
+            self.show(&summary, started);
         }
+        self.board.finish();
         Ok(summary)
+    }
+
+    /// Restates the run as a whole, so a file-level line is never the only thing
+    /// on screen.
+    fn show(&self, summary: &Summary, started: usize) {
+        let done = summary.converted + summary.skipped + summary.failed;
+        let text = format!(
+            "converting {}/{} · saved {}",
+            crate::progress::thousands(done),
+            crate::progress::thousands(started as u64),
+            humansize::format_size(summary.saved_bytes(), humansize::DECIMAL),
+        );
+        if self.board.is_hidden() {
+            if self.board.due_to_log(std::time::Instant::now()) {
+                tracing::info!("{text}");
+            }
+            return;
+        }
+        self.board.summarise(text);
     }
 
     /// One file, start to finish. Any error here leaves the remote untouched.
@@ -184,6 +212,7 @@ impl<R: Remote + 'static> Pipeline<R> {
     }
 
     async fn try_process(&self, row: &FileRow, opts: &Options) -> Result<Outcome> {
+        let slot = self.board.slot(short_name(&row.path));
         let limits = Limits {
             max_file_bytes: self.max_file_bytes,
             allow_video: opts.allow_video,
@@ -212,9 +241,14 @@ impl<R: Remote + 'static> Pipeline<R> {
         let workspace = Workspace::create(&self.staging_dir, job_id)?;
         let input = workspace.input(&row.path);
 
+        slot.stage("downloading");
         {
             let _net = self.governor.network().await;
-            self.remote.download(&row.path, &input).await?;
+            self.remote
+                .download(&row.path, &input, |t| {
+                    slot.detail(describe_transfer("downloading", t, row.size))
+                })
+                .await?;
         }
 
         // Hash the original now, while it is certainly still on disk: some
@@ -223,6 +257,7 @@ impl<R: Remote + 'static> Pipeline<R> {
         // converted beats trusting whatever a listing reported.
         let original_hash = crate::hash::blake3_file(&input).await?;
 
+        slot.stage("inspecting");
         // Now that the bytes are here, settle the decision properly.
         let head = read_head(&input).await?;
         let probe = if classify::kind_from_extension(&row.path).is_video()
@@ -252,6 +287,7 @@ impl<R: Remote + 'static> Pipeline<R> {
                 .as_ref()
                 .context("AV1 requires a probe, which should have been taken already")?;
             let cpu = self.governor.cpu(recipe).await;
+            let duration = probe.duration_secs;
             let (fidelity, attempt) = convert::convert_av1(
                 &input,
                 &output,
@@ -259,12 +295,15 @@ impl<R: Remote + 'static> Pipeline<R> {
                 workspace.path(),
                 cpu.cores(),
                 opts.video,
+                &mut |stage| slot.detail(describe_stage(stage, duration)),
             )
             .await?;
             tracing::info!("{}: crf {}, {}", row.path, attempt.crf, attempt.scores.summary());
             fidelity
         } else {
+            slot.stage("fingerprinting");
             let fingerprint = convert::fingerprint(recipe, &input).await?;
+            slot.stage(format!("encoding ({})", recipe.as_str()));
             {
                 let cpu = self.governor.cpu(recipe).await;
                 convert::encode(
@@ -284,6 +323,7 @@ impl<R: Remote + 'static> Pipeline<R> {
                 let _ = tokio::fs::remove_file(&input).await;
             }
 
+            slot.stage("verifying");
             let cpu = self.governor.cpu(recipe).await;
             convert::verify(recipe, &output, &fingerprint, workspace.path(), cpu.cores()).await?
         };
@@ -341,11 +381,17 @@ impl<R: Remote + 'static> Pipeline<R> {
         let cloud = self.governor.cloud(cloud_mib).await?;
 
         let local_hash = crate::hash::blake3_file(&output).await?;
+        slot.stage("uploading");
         {
             let _net = self.governor.network().await;
-            self.remote.upload(&output, &upload_target).await?;
+            self.remote
+                .upload(&output, &upload_target, |t| {
+                    slot.detail(describe_transfer("uploading", t, output_bytes))
+                })
+                .await?;
         }
 
+        slot.stage("confirming");
         // Confirm what landed before touching the original. `hashsum` is answered
         // server-side, so this costs no download.
         {
@@ -494,6 +540,69 @@ fn swap_extension(path: &str, new_extension: &str) -> String {
 }
 
 /// Reads the first few KiB, for confirming extensions that lie.
+/// The last path segment, which is what identifies a file at a glance. Full
+/// paths are long enough to push everything else off the line.
+fn short_name(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or(path).to_string()
+}
+
+/// Turns an AV1 stage into a line. Video is the reason this exists: one file can
+/// sit in a single stage for hours, so the stage has to say which of several it
+/// is, and how far through.
+fn describe_stage(stage: convert::video_av1::Stage, duration_secs: Option<f64>) -> String {
+    use convert::video_av1::{ATTEMPTS, Stage};
+    match stage {
+        Stage::CrfSearch => "av1 crf-search".to_string(),
+        Stage::Encoding { attempt, crf, tick } => {
+            let head = format!("av1 encode {attempt}/{ATTEMPTS} crf {crf}");
+            match tick.and_then(|t| {
+                Some((t.fraction(duration_secs)?, t.eta_secs(duration_secs)))
+            }) {
+                Some((done, eta)) => match eta {
+                    Some(eta) => format!(
+                        "{head}  {:.0}%  ETA {}",
+                        done * 100.0,
+                        short_duration(eta)
+                    ),
+                    None => format!("{head}  {:.0}%", done * 100.0),
+                },
+                None => head,
+            }
+        }
+        Stage::Scoring { attempt } => format!("av1 scoring {attempt}/{ATTEMPTS}"),
+    }
+}
+
+/// Renders a transfer, falling back to the size we already know when the
+/// backend does not report a total of its own.
+fn describe_transfer(verb: &str, t: crate::remote::Transfer, expected: u64) -> String {
+    use humansize::{DECIMAL, format_size};
+    let total = if t.total_bytes > 0 { t.total_bytes } else { expected };
+    if t.bytes == 0 {
+        return verb.to_string();
+    }
+    let rate = if t.speed > 0.0 {
+        format!("  {}/s", format_size(t.speed as u64, DECIMAL))
+    } else {
+        String::new()
+    };
+    format!(
+        "{verb} {}/{}{rate}",
+        format_size(t.bytes, DECIMAL),
+        format_size(total, DECIMAL)
+    )
+}
+
+/// Compact enough to sit at the end of a line that already has a filename on it.
+fn short_duration(secs: f64) -> String {
+    let secs = secs.max(0.0) as u64;
+    match (secs / 3600, (secs % 3600) / 60, secs % 60) {
+        (0, 0, s) => format!("{s}s"),
+        (0, m, s) => format!("{m}m{s:02}s"),
+        (h, m, _) => format!("{h}h{m:02}m"),
+    }
+}
+
 async fn read_head(path: &std::path::Path) -> Result<Vec<u8>> {
     use tokio::io::AsyncReadExt;
     let mut file = tokio::fs::File::open(path).await?;
@@ -506,6 +615,85 @@ async fn read_head(path: &std::path::Path) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_line_is_labelled_by_the_file_not_the_path() {
+        assert_eq!(short_name("Photos/2019/summer/IMG_0421.MOV"), "IMG_0421.MOV");
+        assert_eq!(short_name("top.jpg"), "top.jpg");
+        assert_eq!(short_name(""), "");
+    }
+
+    #[test]
+    fn durations_stay_short_enough_to_sit_on_one_line() {
+        assert_eq!(short_duration(0.0), "0s");
+        assert_eq!(short_duration(45.0), "45s");
+        assert_eq!(short_duration(200.0), "3m20s");
+        assert_eq!(short_duration(3_600.0), "1h00m");
+        assert_eq!(short_duration(7_845.0), "2h10m");
+        // Never a negative reading, whatever the encoder claims.
+        assert_eq!(short_duration(-5.0), "0s");
+    }
+
+    /// The stage has to say which attempt it is on. An AV1 file can spend hours
+    /// in each of three rounds, and "still encoding" is not the same news as
+    /// "still encoding, on the last try".
+    #[test]
+    fn av1_stages_name_the_attempt() {
+        use convert::video_av1::Stage;
+
+        assert_eq!(describe_stage(Stage::CrfSearch, Some(120.0)), "av1 crf-search");
+        assert_eq!(
+            describe_stage(Stage::Scoring { attempt: 2 }, Some(120.0)),
+            "av1 scoring 2/3"
+        );
+
+        let bare = describe_stage(
+            Stage::Encoding {
+                attempt: 1,
+                crf: 27,
+                tick: None,
+            },
+            Some(120.0),
+        );
+        assert_eq!(bare, "av1 encode 1/3 crf 27");
+    }
+
+    #[test]
+    fn an_encoding_stage_carries_its_progress() {
+        use convert::video_av1::Stage;
+        let tick = convert::Tick {
+            out_time_us: 30_000_000,
+            speed: 2.0,
+        };
+        let line = describe_stage(
+            Stage::Encoding {
+                attempt: 2,
+                crf: 25,
+                tick: Some(tick),
+            },
+            Some(120.0),
+        );
+        assert_eq!(line, "av1 encode 2/3 crf 25  25%  ETA 45s");
+    }
+
+    /// Without a duration there is no percentage to show, and inventing one
+    /// would be worse than the plain stage name.
+    #[test]
+    fn an_unknown_duration_shows_no_percentage() {
+        use convert::video_av1::Stage;
+        let line = describe_stage(
+            Stage::Encoding {
+                attempt: 1,
+                crf: 27,
+                tick: Some(convert::Tick {
+                    out_time_us: 30_000_000,
+                    speed: 2.0,
+                }),
+            },
+            None,
+        );
+        assert_eq!(line, "av1 encode 1/3 crf 27");
+    }
 
     #[test]
     fn a_saving_under_the_threshold_is_not_worth_it() {

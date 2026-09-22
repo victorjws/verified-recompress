@@ -22,7 +22,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::process::{Child, Command};
 
-use super::{About, Entry, HASH_TYPE, Hashes, Remote, parse_about, parse_entries, remote_spec};
+use super::{
+    About, Entry, HASH_TYPE, Hashes, Remote, Transfer, parse_about, parse_entries, remote_spec,
+};
 
 /// How long to wait for the daemon's listener to come up.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
@@ -180,7 +182,10 @@ impl RcdRemote {
 /// while waiting. Unlisted fields are ignored rather than rejected, so a future
 /// rclone adding to the response does not break the parse.
 #[derive(Debug, Default, Clone, Copy, Deserialize)]
-#[serde(rename_all = "camelCase")]
+// Every field defaults: rclone reports a different subset per operation, and a
+// listing has no `bytes` any more than a copy has `listed`. A missing counter is
+// zero, not a parse failure.
+#[serde(rename_all = "camelCase", default)]
 pub struct JobStats {
     /// Directory entries listed so far. This is what makes a recursive listing
     /// observable at all.
@@ -188,6 +193,28 @@ pub struct JobStats {
     pub deletes: u64,
     pub deleted_dirs: u64,
     pub errors: u64,
+    /// Bytes moved, and of how many, for a transfer.
+    pub bytes: u64,
+    pub total_bytes: u64,
+    /// Bytes per second, as rclone averages it over the group.
+    pub speed: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Down,
+    Up,
+}
+
+impl JobStats {
+    /// The transfer counters, in the trait's terms.
+    pub fn transfer(&self) -> Transfer {
+        Transfer {
+            bytes: self.bytes,
+            total_bytes: self.total_bytes,
+            speed: self.speed,
+        }
+    }
 }
 
 /// `job/status`. While a job runs, `output` is null and `error` is empty.
@@ -327,6 +354,54 @@ impl RcdRemote {
         parse_entries(&list.to_string(), scope)
     }
 
+    /// Fetches like [`Remote::download`], reporting bytes as they arrive.
+    ///
+    /// A single file can be several gigabytes over a domestic uplink, which is
+    /// long enough to look stalled.
+    pub async fn download_progress(
+        &self,
+        path: &str,
+        local: &Path,
+        on_tick: impl FnMut(&JobStats) + Send,
+    ) -> Result<()> {
+        let body = self.transfer_request(path, local, Direction::Down)?;
+        let jobid = self.call_async("operations/copyfile", body).await?;
+        self.await_job("operations/copyfile", jobid, on_tick)
+            .await
+            .map(|_| ())
+    }
+
+    /// Stores like [`Remote::upload`], reporting bytes as they leave.
+    pub async fn upload_progress(
+        &self,
+        local: &Path,
+        path: &str,
+        on_tick: impl FnMut(&JobStats) + Send,
+    ) -> Result<()> {
+        let body = self.transfer_request(path, local, Direction::Up)?;
+        let jobid = self.call_async("operations/copyfile", body).await?;
+        self.await_job("operations/copyfile", jobid, on_tick)
+            .await
+            .map(|_| ())
+    }
+
+    /// The `operations/copyfile` body for a transfer in either direction.
+    fn transfer_request(&self, path: &str, local: &Path, dir: Direction) -> Result<Value> {
+        let fs = remote_spec(&self.remote, "");
+        let remote_path = super::normalize_path(path);
+        let (local_dir, name) = split_local(local)?;
+        Ok(match dir {
+            Direction::Down => json!({
+                "srcFs": fs, "srcRemote": remote_path,
+                "dstFs": local_dir, "dstRemote": name,
+            }),
+            Direction::Up => json!({
+                "srcFs": local_dir, "srcRemote": name,
+                "dstFs": fs, "dstRemote": remote_path,
+            }),
+        })
+    }
+
     /// Empties the trash like [`Remote::cleanup`], reporting progress as it goes.
     ///
     /// Whether a backend reports per-file deletes is up to the backend, so the
@@ -395,40 +470,22 @@ impl Remote for RcdRemote {
         self.list_progress(scope, hashes, |_| {})
     }
 
-    fn download(&self, path: &str, local: &Path) -> impl Future<Output = Result<()>> + Send {
-        let fs = remote_spec(&self.remote, "");
-        let remote_path = super::normalize_path(path);
-        let split = split_local(local);
-        async move {
-            let (dir, name) = split?;
-            self.call(
-                "operations/copyfile",
-                json!({
-                    "srcFs": fs, "srcRemote": remote_path,
-                    "dstFs": dir, "dstRemote": name,
-                }),
-            )
-            .await
-            .map(|_| ())
-        }
+    fn download(
+        &self,
+        path: &str,
+        local: &Path,
+        mut on_tick: impl FnMut(Transfer) + Send,
+    ) -> impl Future<Output = Result<()>> + Send {
+        self.download_progress(path, local, move |stats| on_tick(stats.transfer()))
     }
 
-    fn upload(&self, local: &Path, path: &str) -> impl Future<Output = Result<()>> + Send {
-        let fs = remote_spec(&self.remote, "");
-        let remote_path = super::normalize_path(path);
-        let split = split_local(local);
-        async move {
-            let (dir, name) = split?;
-            self.call(
-                "operations/copyfile",
-                json!({
-                    "srcFs": dir, "srcRemote": name,
-                    "dstFs": fs, "dstRemote": remote_path,
-                }),
-            )
-            .await
-            .map(|_| ())
-        }
+    fn upload(
+        &self,
+        local: &Path,
+        path: &str,
+        mut on_tick: impl FnMut(Transfer) + Send,
+    ) -> impl Future<Output = Result<()>> + Send {
+        self.upload_progress(local, path, move |stats| on_tick(stats.transfer()))
     }
 
     fn delete(&self, path: &str) -> impl Future<Output = Result<()>> + Send {
@@ -748,8 +805,10 @@ mod tests {
         assert_eq!(stats.errors, 0);
     }
 
-    /// `deletedDirs` is the one field whose name does not survive a naive
-    /// snake_case mapping, so it gets its own check.
+    /// `deletedDirs` and `totalBytes` are the fields whose names do not survive
+    /// a naive snake_case mapping, so they get their own check. The partial
+    /// object also stands in for what rclone actually sends: each operation
+    /// reports its own counters and omits the rest.
     #[test]
     fn stats_map_camel_case_names() {
         let stats: JobStats =
@@ -757,6 +816,14 @@ mod tests {
         assert_eq!(stats.deleted_dirs, 2);
         assert_eq!(stats.deletes, 7);
         assert_eq!(stats.errors, 1);
+        assert_eq!(stats.bytes, 0, "a listing reports no transfer");
+
+        let transfer: JobStats =
+            serde_json::from_str(r#"{"bytes":1024,"totalBytes":4096,"speed":512.5}"#).unwrap();
+        assert_eq!(transfer.bytes, 1024);
+        assert_eq!(transfer.total_bytes, 4096);
+        assert!((transfer.speed - 512.5).abs() < f64::EPSILON);
+        assert_eq!(transfer.listed, 0, "a copy reports no listing");
     }
 
     /// The scope belongs in `fs`. Putting it in `remote` also works and returns

@@ -9,7 +9,9 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use tokio::process::Command;
 
-use super::{About, Entry, HASH_TYPE, Hashes, Remote, parse_about, parse_entries, remote_spec};
+use super::{
+    About, Entry, HASH_TYPE, Hashes, Remote, Transfer, parse_about, parse_entries, remote_spec,
+};
 
 pub struct CliRemote {
     remote: String,
@@ -106,7 +108,15 @@ impl Remote for CliRemote {
         }
     }
 
-    fn download(&self, path: &str, local: &Path) -> impl Future<Output = Result<()>> + Send {
+    /// The CLI path reports nothing: rclone's own progress goes to a terminal
+    /// rather than a parseable stream, and this implementation exists as the
+    /// parity reference rather than for production runs.
+    fn download(
+        &self,
+        path: &str,
+        local: &Path,
+        _on_tick: impl FnMut(Transfer) + Send,
+    ) -> impl Future<Output = Result<()>> + Send {
         let spec = remote_spec(&self.remote, path);
         let local = local.to_string_lossy().into_owned();
         async move {
@@ -116,7 +126,12 @@ impl Remote for CliRemote {
         }
     }
 
-    fn upload(&self, local: &Path, path: &str) -> impl Future<Output = Result<()>> + Send {
+    fn upload(
+        &self,
+        local: &Path,
+        path: &str,
+        _on_tick: impl FnMut(Transfer) + Send,
+    ) -> impl Future<Output = Result<()>> + Send {
         let spec = remote_spec(&self.remote, path);
         let local = local.to_string_lossy().into_owned();
         async move { self.run(&["copyto", &local, &spec]).await.map(|_| ()) }

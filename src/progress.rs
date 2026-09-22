@@ -5,16 +5,19 @@
 //! there is no way to tell a slow call from a hung one, which is the only
 //! question worth answering while waiting.
 //!
-//! [`Activity`] draws a spinner alongside whatever counter the caller can
-//! supply. When stderr is not a terminal — a pipe, a redirect, CI — indicatif
-//! draws nothing at all, so the same updates go out as occasional log lines
-//! instead.
+//! `run` has the same problem in a different shape: a single AV1 encode can
+//! take hours, and the pipeline works on several files at once, so [`Board`]
+//! keeps a line per file under a summary of the run as a whole.
+//!
+//! Everything here draws a spinner alongside whatever the caller can report.
+//! When stderr is not a terminal — a pipe, a redirect, CI — indicatif draws
+//! nothing at all, so the same updates go out as occasional log lines instead.
 
 use std::borrow::Cow;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
 /// Redraw rate for the spinner itself. Independent of how often the caller has
 /// a new counter to report, so the spinner keeps moving between updates.
@@ -24,25 +27,38 @@ const TICK: Duration = Duration::from_millis(100);
 /// the run is alive, rare enough not to bury the real output in a CI log.
 const LOG_EVERY: Duration = Duration::from_secs(15);
 
-/// The spinner currently on screen, if any.
+/// Braille spinner frames. The trailing space is the finished state.
+const TICKS: &str = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ ";
+
+/// Whatever is currently drawing, if anything.
 ///
 /// A global because the log writer has to find it from anywhere: a line written
-/// while the spinner is mid-redraw would otherwise land on top of it, which is
-/// exactly what happens under `-vv` when the poll loop traces every request.
-static ACTIVE: Mutex<Option<ProgressBar>> = Mutex::new(None);
+/// mid-redraw would otherwise land on top of the display, which is exactly what
+/// happens under `-vv` when the poll loop traces every request.
+static ACTIVE: Mutex<Option<Drawing>> = Mutex::new(None);
 
-/// Runs `f` with any active spinner cleared, restoring it afterwards.
+enum Drawing {
+    One(ProgressBar),
+    Many(MultiProgress),
+}
+
+/// Runs `f` with anything on screen cleared, restoring it afterwards.
 ///
 /// Falls through to running `f` directly if the registry is busy. Losing the
 /// clear costs one smudged line; blocking on it could deadlock the logger.
 pub fn suspend<R>(f: impl FnOnce() -> R) -> R {
     match ACTIVE.try_lock() {
         Ok(guard) => match guard.as_ref() {
-            Some(bar) => bar.suspend(f),
+            Some(Drawing::One(bar)) => bar.suspend(f),
+            Some(Drawing::Many(multi)) => multi.suspend(f),
             None => f(),
         },
         Err(_) => f(),
     }
+}
+
+fn register(drawing: Option<Drawing>) {
+    *ACTIVE.lock().unwrap_or_else(PoisonError::into_inner) = drawing;
 }
 
 /// A long-running step, shown as a spinner with a counter and elapsed time.
@@ -66,7 +82,7 @@ impl Activity {
         // A malformed template is a bug in this file, not a runtime condition. An
         // unstyled spinner is a better outcome than taking the command down.
         match ProgressStyle::with_template("  {spinner} {msg} · {elapsed_precise}") {
-            Ok(style) => bar.set_style(style.tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ ")),
+            Ok(style) => bar.set_style(style.tick_chars(TICKS)),
             Err(e) => tracing::debug!("progress template rejected: {e}"),
         }
         bar.set_message("working");
@@ -74,7 +90,7 @@ impl Activity {
 
         // After the label is logged, so `start` cannot suspend a bar it is still
         // in the middle of creating.
-        *ACTIVE.lock().unwrap_or_else(PoisonError::into_inner) = Some(bar.clone());
+        register(Some(Drawing::One(bar.clone())));
 
         Self {
             bar,
@@ -99,22 +115,134 @@ impl Activity {
     /// Clears the spinner line. Call before printing anything else, or the
     /// redraw and the output fight over the same line.
     pub fn finish(&self) {
-        *ACTIVE.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        register(None);
         self.bar.finish_and_clear();
     }
 
     /// Whether enough time has passed to log again, stamping `now` if so.
     fn due_to_log(&self, now: Instant) -> bool {
-        let mut last = self
-            .last_log
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if now.duration_since(*last) < LOG_EVERY {
-            return false;
-        }
-        *last = now;
-        true
+        due(&self.last_log, now)
     }
+}
+
+
+/// The run display: one summary line, plus a line per file being worked on.
+///
+/// Files come and go as the pipeline claims and finishes them, so the lines are
+/// owned by the jobs rather than by the board. Dropping a [`Slot`] takes its
+/// line away.
+pub struct Board {
+    multi: MultiProgress,
+    summary: ProgressBar,
+    last_log: Mutex<Instant>,
+}
+
+impl Board {
+    pub fn start(total: Option<u64>) -> Self {
+        let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr());
+        let summary = multi.add(ProgressBar::new_spinner());
+        if let Ok(style) = ProgressStyle::with_template("{msg} · {elapsed_precise}") {
+            summary.set_style(style);
+        }
+        summary.set_message(match total {
+            Some(n) => format!("converting 0/{}", thousands(n)),
+            None => "converting".to_string(),
+        });
+        summary.enable_steady_tick(TICK);
+
+        register(Some(Drawing::Many(multi.clone())));
+        Self {
+            multi,
+            summary,
+            last_log: Mutex::new(Instant::now()),
+        }
+    }
+
+    /// Replaces the summary line. The caller owns the wording because only it
+    /// knows what the run is counting.
+    pub fn summarise(&self, text: impl Into<Cow<'static, str>>) {
+        self.summary.set_message(text);
+    }
+
+    /// Opens a line for one file. It lives until the returned [`Slot`] is dropped.
+    pub fn slot(&self, label: impl Into<String>) -> Slot {
+        let bar = self.multi.add(ProgressBar::new_spinner());
+        if let Ok(style) = ProgressStyle::with_template("  {spinner} {prefix} {msg}") {
+            bar.set_style(style.tick_chars(TICKS));
+        }
+        bar.set_prefix(label.into());
+        bar.enable_steady_tick(TICK);
+        Slot {
+            bar,
+            hidden: self.multi.is_hidden(),
+            last_log: Mutex::new(Instant::now()),
+        }
+    }
+
+    pub fn finish(&self) {
+        register(None);
+        self.summary.finish_and_clear();
+        let _ = self.multi.clear();
+    }
+
+    /// Whether enough time has passed to log the summary again.
+    pub fn due_to_log(&self, now: Instant) -> bool {
+        due(&self.last_log, now)
+    }
+
+    pub fn is_hidden(&self) -> bool {
+        self.multi.is_hidden()
+    }
+}
+
+/// One file's line on the [`Board`].
+pub struct Slot {
+    bar: ProgressBar,
+    hidden: bool,
+    last_log: Mutex<Instant>,
+}
+
+impl Slot {
+    /// Names the stage this file is at: `downloading`, `av1 encode 2/3`, and so
+    /// on. Stages are worth naming because an AV1 file goes through several, and
+    /// "still going" is a different message from "still going, on attempt three".
+    pub fn stage(&self, text: impl Into<Cow<'static, str>>) {
+        let text = text.into();
+        if self.hidden {
+            // No terminal, so nothing was drawn. A stage change is rare enough to
+            // log every time; it is the within-stage churn that needs throttling.
+            tracing::info!("{}: {text}", self.bar.prefix());
+            return;
+        }
+        self.bar.set_message(text);
+    }
+
+    /// Reports movement inside the current stage, which arrives far too often to
+    /// log every time.
+    pub fn detail(&self, text: impl Into<Cow<'static, str>>) {
+        if self.hidden {
+            if due(&self.last_log, Instant::now()) {
+                tracing::info!("{}: {}", self.bar.prefix(), text.into());
+            }
+            return;
+        }
+        self.bar.set_message(text);
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.bar.finish_and_clear();
+    }
+}
+
+fn due(last: &Mutex<Instant>, now: Instant) -> bool {
+    let mut last = last.lock().unwrap_or_else(PoisonError::into_inner);
+    if now.duration_since(*last) < LOG_EVERY {
+        return false;
+    }
+    *last = now;
+    true
 }
 
 /// Groups digits so a six-figure counter is readable at a glance.

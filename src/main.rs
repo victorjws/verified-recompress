@@ -465,7 +465,7 @@ async fn run_bench(cfg: &Config, sample: usize) -> Result<()> {
     for (index, row) in candidates.iter().enumerate() {
         tracing::info!("\nSample {}/{}: {}", index + 1, candidates.len(), row.path);
         let local = work.path().join(format!("sample{index}.bin"));
-        remote.download(&row.path, &local).await?;
+        remote.download(&row.path, &local, |_| {}).await?;
 
         for preset in bench::PRESETS {
             match bench::measure_one(&local, work.path(), preset, true, 26, &[], hwaccel).await {
@@ -576,7 +576,7 @@ async fn verify_one(
     }
 
     let converted = work.join(restore::staged_name("converted", &record.output_path));
-    remote.download(&record.output_path, &converted).await?;
+    remote.download(&record.output_path, &converted, |_| {}).await?;
     let rebuilt = work.join(restore::staged_name("rebuilt", &record.path));
     restore::rebuild(record, &converted, &rebuilt).await?;
     restore::confirm(record, &rebuilt).await?;
@@ -601,7 +601,7 @@ async fn run_restore(cfg: &Config, path: &str, execute: bool) -> Result<()> {
     let converted = work
         .path()
         .join(restore::staged_name("converted", &record.output_path));
-    remote.download(&record.output_path, &converted).await?;
+    remote.download(&record.output_path, &converted, |_| {}).await?;
     let rebuilt = work
         .path()
         .join(restore::staged_name("rebuilt", &record.path));
@@ -622,7 +622,7 @@ async fn run_restore(cfg: &Config, path: &str, execute: bool) -> Result<()> {
         remote.shutdown().await?;
         bail!("{} already exists; not overwriting it", record.path);
     }
-    remote.upload(&rebuilt, &record.path).await?;
+    remote.upload(&rebuilt, &record.path, |_| {}).await?;
     remote.shutdown().await?;
 
     emit!(

@@ -150,8 +150,19 @@ pub async fn convert_av1(
     work_dir: &Path,
     cores: &[usize],
     video: VideoOptions,
+    // `Send` because the pipeline runs files on spawned tasks.
+    report: &mut (dyn FnMut(video_av1::Stage) + Send),
 ) -> Result<(Fidelity, video_av1::Attempt)> {
-    video_av1::encode_to_gate(input, output, probe, &video.settings(), work_dir, cores).await
+    video_av1::encode_to_gate(
+        input,
+        output,
+        probe,
+        &video.settings(),
+        work_dir,
+        cores,
+        report,
+    )
+    .await
 }
 
 /// Proves the encode preserved what the recipe promises.
@@ -226,6 +237,121 @@ pub fn command(program: &str, cores: &[usize]) -> Command {
 
 fn taskset_available() -> bool {
     cfg!(target_os = "linux")
+}
+
+/// One ffmpeg progress report, as `-progress` emits them.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Tick {
+    /// Position in the output, in microseconds.
+    pub out_time_us: u64,
+    /// Encoding rate relative to real time, as ffmpeg computes it.
+    pub speed: f64,
+}
+
+impl Tick {
+    /// How far along, given the source duration. `None` when the duration is
+    /// unknown, which is better than drawing a bar that means nothing.
+    pub fn fraction(&self, duration_secs: Option<f64>) -> Option<f64> {
+        let total = duration_secs.filter(|d| *d > 0.0)?;
+        Some((self.out_time_us as f64 / 1_000_000.0 / total).clamp(0.0, 1.0))
+    }
+
+    /// Seconds of wall clock still to go, from ffmpeg's own speed figure.
+    pub fn eta_secs(&self, duration_secs: Option<f64>) -> Option<f64> {
+        let total = duration_secs.filter(|d| *d > 0.0)?;
+        if self.speed <= 0.0 {
+            return None;
+        }
+        let done = self.out_time_us as f64 / 1_000_000.0;
+        Some(((total - done) / self.speed).max(0.0))
+    }
+}
+
+/// Parses one `key=value` line from `-progress`, updating `tick`.
+///
+/// Returns true once the block is complete, which is what makes a report worth
+/// showing: the values within one block belong to the same instant.
+pub(crate) fn absorb_progress(line: &str, tick: &mut Tick) -> bool {
+    let Some((key, value)) = line.split_once('=') else {
+        return false;
+    };
+    let value = value.trim();
+    match key.trim() {
+        "out_time_us" => tick.out_time_us = value.parse().unwrap_or(tick.out_time_us),
+        // ffmpeg writes "14.1x", and "N/A" before it has measured anything.
+        "speed" => {
+            tick.speed = value
+                .trim_end_matches('x')
+                .parse()
+                .unwrap_or(tick.speed)
+        }
+        "progress" => return true,
+        _ => {}
+    }
+    false
+}
+
+/// Runs ffmpeg with `-progress`, reporting each block as it arrives.
+///
+/// Separate from [`run`] rather than replacing it: every verification path goes
+/// through `run`, and they are short commands whose output is wanted whole. This
+/// one exists for the encodes that take hours.
+///
+/// The progress stream has to be read to the end whatever happens. Leaving it
+/// unread fills the pipe buffer and stops the encoder.
+pub(crate) async fn run_with_progress(
+    mut cmd: Command,
+    what: &str,
+    mut on_tick: impl FnMut(Tick),
+) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    tracing::debug!("run {}", crate::proc::describe(cmd.as_std()));
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to execute {what}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .context("ffmpeg produced no progress stream")?;
+    let stderr = child.stderr.take().context("ffmpeg produced no stderr")?;
+
+    // Drained concurrently: a failing encode can write more than a pipe holds,
+    // and a blocked stderr stops the process just as surely as a blocked stdout.
+    let collect = tokio::spawn(async move {
+        let mut text = String::new();
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            text.push_str(&line);
+            text.push('\n');
+        }
+        text
+    });
+
+    let mut tick = Tick::default();
+    let mut lines = BufReader::new(stdout).lines();
+    while let Some(line) = lines.next_line().await? {
+        if absorb_progress(&line, &mut tick) {
+            on_tick(tick);
+        }
+    }
+
+    let status = child
+        .wait()
+        .await
+        .with_context(|| format!("failed to wait on {what}"))?;
+    let errors = collect.await.unwrap_or_default();
+    if !status.success() {
+        bail!(
+            "{what} failed (exit {}): {}",
+            status.code().unwrap_or(-1),
+            errors.trim()
+        );
+    }
+    Ok(())
 }
 
 /// Runs a command, failing with its stderr attached.

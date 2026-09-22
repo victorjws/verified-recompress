@@ -59,6 +59,19 @@ pub struct Entry {
     pub blake3: Option<String>,
 }
 
+/// How a transfer is getting on, in terms every backend can speak.
+///
+/// Zeroes mean "not reported" rather than "nothing moved": a backend that cannot
+/// say is not the same as one that has moved nothing, and a caller drawing a bar
+/// has to be able to tell the difference.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct Transfer {
+    pub bytes: u64,
+    pub total_bytes: u64,
+    /// Bytes per second.
+    pub speed: f64,
+}
+
 /// Quota figures. Backends may report any subset; Filen reports at least used and total.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct About {
@@ -77,11 +90,25 @@ pub trait Remote: Send + Sync {
     fn list(&self, scope: &str, hashes: Hashes)
     -> impl Future<Output = Result<Vec<Entry>>> + Send;
 
-    /// Fetches one file to a local path.
-    fn download(&self, path: &str, local: &Path) -> impl Future<Output = Result<()>> + Send;
+    /// Fetches one file to a local path, reporting progress as it arrives.
+    ///
+    /// A single file can be gigabytes over a domestic uplink, which is long
+    /// enough to look stalled. A backend with nothing to report simply never
+    /// calls `on_tick`.
+    fn download(
+        &self,
+        path: &str,
+        local: &Path,
+        on_tick: impl FnMut(Transfer) + Send,
+    ) -> impl Future<Output = Result<()>> + Send;
 
     /// Stores a local file at `path`, replacing whatever is there.
-    fn upload(&self, local: &Path, path: &str) -> impl Future<Output = Result<()>> + Send;
+    fn upload(
+        &self,
+        local: &Path,
+        path: &str,
+        on_tick: impl FnMut(Transfer) + Send,
+    ) -> impl Future<Output = Result<()>> + Send;
 
     /// Removes one file. On Filen this moves it to the trash, which still counts
     /// against the quota until [`Remote::cleanup`] runs.

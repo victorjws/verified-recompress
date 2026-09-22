@@ -206,7 +206,7 @@ async fn av1_encodes_and_scores_above_the_gate() {
     };
 
     // Encode well inside the transparent range so the gate should pass.
-    video_av1::encode(&source, &output, 18, &settings, &[])
+    video_av1::encode(&source, &output, 18, &settings, &[], |_| {})
         .await
         .unwrap();
 
@@ -238,7 +238,7 @@ async fn a_low_quality_av1_encode_fails_the_gate() {
         ..Default::default()
     };
     // A CRF this high is visibly degraded.
-    video_av1::encode(&source, &output, 60, &settings, &[])
+    video_av1::encode(&source, &output, 60, &settings, &[], |_| {})
         .await
         .unwrap();
 
@@ -273,6 +273,7 @@ async fn av1_copies_the_audio_stream_untouched() {
             ..Default::default()
         },
         &[],
+        |_| {},
     )
     .await
     .unwrap();
@@ -311,6 +312,7 @@ async fn av1_does_not_double_apply_rotation() {
             ..Default::default()
         },
         &[],
+        |_| {},
     )
     .await
     .unwrap();

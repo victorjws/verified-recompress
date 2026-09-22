@@ -223,6 +223,26 @@ metadata with `exiftool -a -G1 <original> <converted>`.
 
 ### `run [flags]`
 
+The pipeline works on several files at once, and a single AV1 encode can run for hours, so it
+draws a line per file under a summary of the run:
+
+```
+converting 12/340 · saved 4.2 GB · 00:12:04
+  ⠹ IMG_0421.MOV  av1 crf-search
+  ⠹ IMG_0388.MOV  av1 encode 2/3 crf 25  47%  ETA 3m20s
+  ⠹ beach.mp4     uploading 1.2 GB/3.4 GB  8.1 MB/s
+  ⠹ sunset.jpg    verifying
+```
+
+The attempt number matters: a file that fails the quality gate is encoded again at a tighter CRF,
+up to three times, and each round is scored by decoding both files in full. "Still encoding" and
+"still encoding, on the last try" are different news. Percentages come from ffmpeg's own progress
+stream against the duration ffprobe reported; a file whose duration is unknown shows the stage
+without a percentage rather than an invented one.
+
+Where stderr is not a terminal, stage changes are logged and the within-stage churn is throttled,
+so a redirected run records what happened without a line per frame.
+
 Converts files. **Without `--execute` it is a dry run**: it plans, stages and reports, but writes
 nothing to the remote.
 
@@ -408,7 +428,7 @@ Other things worth knowing:
 ## Development
 
 ```sh
-cargo test          # 320 tests
+cargo test          # 325 tests
 cargo build --release
 ```
 

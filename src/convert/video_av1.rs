@@ -14,7 +14,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
-use super::{Fidelity, command, run};
+use super::{Fidelity, command};
 use crate::classify::MediaProbe;
 use crate::vmaf::{self, Scores};
 
@@ -72,9 +72,12 @@ pub async fn encode(
     crf: u8,
     settings: &Settings,
     cores: &[usize],
+    on_tick: impl FnMut(super::Tick),
 ) -> Result<()> {
     let mut cmd = command("ffmpeg", cores);
-    cmd.args(["-v", "error"]);
+    // `-progress pipe:1` reports on stdout, which this invocation does not
+    // otherwise use. Errors stay on stderr where the failure path expects them.
+    cmd.args(["-v", "error", "-progress", "pipe:1", "-nostats"]);
     if settings.hwaccel {
         cmd.args(["-hwaccel", "cuda"]);
     }
@@ -107,7 +110,7 @@ pub async fn encode(
             "-y",
         ])
         .arg(output);
-    run(cmd, "ffmpeg (svt-av1)").await
+    super::run_with_progress(cmd, "ffmpeg (svt-av1)", on_tick).await
 }
 
 /// Finds a CRF that meets the VMAF target, sampling scenes rather than encoding
@@ -159,6 +162,27 @@ pub struct Attempt {
     pub scores: Scores,
 }
 
+/// Where an AV1 conversion has got to.
+///
+/// One file goes through a CRF search and then up to [`MAX_ATTEMPTS`] rounds of
+/// encode-and-score, each of which can run for hours. Naming the stage is the
+/// difference between "still going" and "still going, on the third attempt".
+#[derive(Debug, Clone, Copy)]
+pub enum Stage {
+    CrfSearch,
+    Encoding {
+        attempt: u8,
+        crf: u8,
+        tick: Option<super::Tick>,
+    },
+    Scoring {
+        attempt: u8,
+    },
+}
+
+/// How many rounds a file may take, so a caller can say "2 of 3".
+pub const ATTEMPTS: u8 = MAX_ATTEMPTS;
+
 /// Encodes, measures, and tightens the CRF until the gate is met or attempts run out.
 ///
 /// The search only samples scenes, so its answer is a starting point rather than
@@ -170,6 +194,7 @@ pub async fn encode_to_gate(
     settings: &Settings,
     work_dir: &Path,
     cores: &[usize],
+    report: &mut (dyn FnMut(Stage) + Send),
 ) -> Result<(Fidelity, Attempt)> {
     let video = probe
         .video
@@ -177,6 +202,7 @@ pub async fn encode_to_gate(
         .context("no video stream to encode")?;
     let model = vmaf::model_for(video.width, video.height);
 
+    report(Stage::CrfSearch);
     let mut crf = match search_crf(input, settings, cores).await {
         Ok(crf) => crf,
         Err(e) => {
@@ -187,7 +213,23 @@ pub async fn encode_to_gate(
 
     let mut last = None;
     for attempt in 1..=MAX_ATTEMPTS {
-        encode(input, output, crf, settings, cores).await?;
+        report(Stage::Encoding {
+            attempt,
+            crf,
+            tick: None,
+        });
+        encode(input, output, crf, settings, cores, |tick| {
+            report(Stage::Encoding {
+                attempt,
+                crf,
+                tick: Some(tick),
+            })
+        })
+        .await?;
+
+        // Scoring decodes both files in full, so it is its own wait and has to
+        // say so rather than looking like a stalled encode.
+        report(Stage::Scoring { attempt });
         let scores = vmaf::measure(output, input, model, work_dir, cores, settings.hwaccel).await?;
 
         if scores.passes() {

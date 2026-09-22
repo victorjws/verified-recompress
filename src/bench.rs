@@ -106,7 +106,8 @@ pub async fn measure_one(
     };
 
     let started = Instant::now();
-    video_av1::encode(source, &output, crf, &settings, cores).await?;
+    // `bench` reports per sample, not per frame, so it discards the ticks.
+    video_av1::encode(source, &output, crf, &settings, cores, |_| {}).await?;
     let elapsed = started.elapsed();
 
     let scores = vmaf::measure(&output, source, model, work_dir, cores, hwaccel).await?;
