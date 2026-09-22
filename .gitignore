@@ -4,6 +4,9 @@
 /.idea/
 /.vscode/
 
+# Working notes, not a repository artifact
+/PLAN.md
+
 # Local runtime state
 /staging/
 *.sqlite

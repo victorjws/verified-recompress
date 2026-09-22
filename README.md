@@ -138,9 +138,21 @@ finding; warnings (such as a missing `taskset` off Linux) do not fail it.
 Lists the remote and records every file in the ledger. Downloads nothing, modifies nothing. Run it
 again whenever the drive changes.
 
+One recursive request covers a whole scope, so a large drive can spend minutes inside a single
+call. A counter runs while it does, which is how you tell a slow listing from a stuck one:
+
 ```
-Inventoried 12043 file(s) across 2 scope(s).
-  pending 11890  done 0  skipped 153  failed 0  total 412.7 GB
+listing /
+  ⠹ listed 86,068 entries · 00:00:15
+```
+
+Filen answers that request in bulk and then decrypts every name locally, so the counter sits at
+zero for the fetch and climbs during the decrypt. When stderr is not a terminal the same updates
+go out as a log line every 15 seconds instead.
+
+```
+Inventoried 12,043 file(s) across 2 scope(s).
+  pending 11,890  done 0  skipped 153  failed 0  total 412.7 GB
 ```
 
 ### `plan`
@@ -223,6 +235,9 @@ Reports files stored more than once, from the inventory alone. Read-only; delete
 
 Empties the trash. Without `--execute` it reports what would be purged. With it, the originals are
 gone for good and can no longer be restored from the Filen web app.
+
+Purging hundreds of gigabytes is another single long call, so it shows the same spinner as `scan`.
+Whether the file counter moves is up to the backend; the elapsed time always does.
 
 It also compares the space the remote actually freed against what the ledger expected, and says so
 when they diverge, since that usually means old file versions or an older trash are holding space
@@ -338,7 +353,7 @@ Other things worth knowing:
 ## Development
 
 ```sh
-cargo test          # 280 tests
+cargo test          # 289 tests
 cargo build --release
 ```
 

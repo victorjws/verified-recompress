@@ -28,6 +28,9 @@ use super::{About, Entry, HASH_TYPE, Remote, parse_about, parse_entries, remote_
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 /// Grace period for a polite `core/quit` before the child is killed.
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(1500);
+/// How often to ask how a long-running job is doing. The calls go over loopback,
+/// so the cost is noise next to a listing that runs for minutes.
+const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const RC_USER: &str = "verified-recompress";
 
 pub struct RcdRemote {
@@ -123,6 +126,154 @@ impl RcdRemote {
     }
 }
 
+/// Running counters for one job, as `core/stats` reports them.
+///
+/// rclone reports a good deal more; these are the fields a caller can show
+/// while waiting. Unlisted fields are ignored rather than rejected, so a future
+/// rclone adding to the response does not break the parse.
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobStats {
+    /// Directory entries listed so far. This is what makes a recursive listing
+    /// observable at all.
+    pub listed: u64,
+    pub deletes: u64,
+    pub deleted_dirs: u64,
+    pub errors: u64,
+}
+
+/// `job/status`. While a job runs, `output` is null and `error` is empty.
+#[derive(Debug, Deserialize)]
+struct JobStatus {
+    finished: bool,
+    #[serde(default)]
+    error: String,
+    /// The stats group rclone opened for this job, read rather than derived from
+    /// the job id so the naming convention is rclone's business, not ours.
+    #[serde(default)]
+    group: String,
+    #[serde(default)]
+    output: Value,
+}
+
+/// Long-running calls, driven as background jobs so their progress is visible.
+///
+/// An rc call made the ordinary way returns nothing until it is completely
+/// finished, which for a recursive listing of a whole drive can be many minutes
+/// of silence. Passing `_async` instead yields a job id immediately and opens a
+/// stats group rclone updates as the work proceeds.
+impl RcdRemote {
+    /// POSTs with `_async` set, returning the job id rclone assigned.
+    async fn call_async(&self, method: &str, mut body: Value) -> Result<u64> {
+        body["_async"] = Value::Bool(true);
+        let value = self.call(method, body).await?;
+        value
+            .get("jobid")
+            .and_then(Value::as_u64)
+            .with_context(|| format!("rc call {method} did not return a job id"))
+    }
+
+    /// Polls until the job finishes, reporting its stats in between, and returns
+    /// the output the same call made synchronously would have produced.
+    async fn await_job(
+        &self,
+        method: &str,
+        jobid: u64,
+        mut on_tick: impl FnMut(&JobStats) + Send,
+    ) -> Result<Value> {
+        loop {
+            let value = self.call("job/status", json!({ "jobid": jobid })).await?;
+            let status: JobStatus = serde_json::from_value(value)
+                .with_context(|| format!("job/status for {method} had an unexpected shape"))?;
+
+            if status.finished {
+                // A job reports its failure here rather than through the HTTP
+                // status, which `call` already covers, so this is the only place
+                // an async failure surfaces. Swallowing it would turn a failed
+                // listing into an empty one.
+                if !status.error.is_empty() {
+                    bail!("rc call {method} failed: {}", status.error);
+                }
+                return Ok(status.output);
+            }
+
+            on_tick(&self.job_stats(&status.group).await);
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    /// Best effort: stats only describe the job, so failing to read them must not
+    /// fail the job itself.
+    async fn job_stats(&self, group: &str) -> JobStats {
+        if group.is_empty() {
+            return JobStats::default();
+        }
+        let body = json!({ "group": group, "short": true });
+        match self.call("core/stats", body).await {
+            Ok(value) => serde_json::from_value(value).unwrap_or_else(|e| {
+                tracing::debug!("could not parse stats for {group}: {e}");
+                JobStats::default()
+            }),
+            Err(e) => {
+                tracing::debug!("could not read stats for {group}: {e:#}");
+                JobStats::default()
+            }
+        }
+    }
+
+    /// The `operations/list` request body, shared by the plain and observed paths.
+    fn list_request(&self, scope: &str) -> Value {
+        json!({
+            "fs": remote_spec(&self.remote, ""),
+            "remote": super::normalize_path(scope),
+            "opt": {
+                "recurse": true,
+                "filesOnly": true,
+                "showHash": true,
+                "hashTypes": [HASH_TYPE],
+            }
+        })
+    }
+
+    /// Lists like [`Remote::list`], reporting entries seen while the call is in
+    /// flight.
+    ///
+    /// Filen answers a recursive listing from one bulk request and then decrypts
+    /// every name locally, so `listed` stays at zero for the fetch and climbs
+    /// during the decrypt. The transition is itself informative; a smoothly
+    /// rising count from the first second is not on offer.
+    pub async fn list_progress(
+        &self,
+        scope: &str,
+        on_tick: impl FnMut(&JobStats) + Send,
+    ) -> Result<Vec<Entry>> {
+        let jobid = self
+            .call_async("operations/list", self.list_request(scope))
+            .await?;
+        let output = self.await_job("operations/list", jobid, on_tick).await?;
+        let list = output
+            .get("list")
+            .context("operations/list response had no `list` field")?;
+        // Unlike `lsjson`, whose paths are relative to the listed directory,
+        // `operations/list` returns paths relative to `fs` with the `remote`
+        // sub-path already included. So the scope must NOT be prefixed again.
+        parse_entries(&list.to_string(), "")
+    }
+
+    /// Empties the trash like [`Remote::cleanup`], reporting progress as it goes.
+    ///
+    /// Whether a backend reports per-file deletes is up to the backend, so the
+    /// counter may stay at zero throughout. The elapsed time still answers the
+    /// question the caller is actually asking.
+    pub async fn cleanup_progress(&self, on_tick: impl FnMut(&JobStats) + Send) -> Result<()> {
+        let body = json!({ "fs": remote_spec(&self.remote, "") });
+        let jobid = self.call_async("operations/cleanup", body).await?;
+        self.await_job("operations/cleanup", jobid, on_tick)
+            .await
+            .map(|_| ())
+    }
+}
+
 impl Drop for RcdRemote {
     fn drop(&mut self) {
         // Ask politely first, then make sure. `core/quit` returns before the process
@@ -171,33 +322,10 @@ struct HashResponse {
 }
 
 impl Remote for RcdRemote {
+    /// Delegates to [`RcdRemote::list_progress`] rather than repeating it, so the
+    /// parity suite exercises the path the CLI actually runs.
     fn list(&self, scope: &str) -> impl Future<Output = Result<Vec<Entry>>> + Send {
-        let fs = remote_spec(&self.remote, "");
-        let remote_path = super::normalize_path(scope);
-        async move {
-            let value = self
-                .call(
-                    "operations/list",
-                    json!({
-                        "fs": fs,
-                        "remote": remote_path,
-                        "opt": {
-                            "recurse": true,
-                            "filesOnly": true,
-                            "showHash": true,
-                            "hashTypes": [HASH_TYPE],
-                        }
-                    }),
-                )
-                .await?;
-            let list = value
-                .get("list")
-                .context("operations/list response had no `list` field")?;
-            // Unlike `lsjson`, whose paths are relative to the listed directory,
-            // `operations/list` returns paths relative to `fs` with the `remote`
-            // sub-path already included. So the scope must NOT be prefixed again.
-            parse_entries(&list.to_string(), "")
-        }
+        self.list_progress(scope, |_| {})
     }
 
     fn download(&self, path: &str, local: &Path) -> impl Future<Output = Result<()>> + Send {
@@ -267,12 +395,7 @@ impl Remote for RcdRemote {
     }
 
     fn cleanup(&self) -> impl Future<Output = Result<()>> + Send {
-        let fs = remote_spec(&self.remote, "");
-        async move {
-            self.call("operations/cleanup", json!({ "fs": fs }))
-                .await
-                .map(|_| ())
-        }
+        self.cleanup_progress(|_| {})
     }
 
     fn about(&self) -> impl Future<Output = Result<About>> + Send {
@@ -401,5 +524,131 @@ mod tests {
         let r: HashResponse =
             serde_json::from_str(r#"{"hash":"ea8f16","hashType":"blake3"}"#).unwrap();
         assert_eq!(r.hash.as_deref(), Some("ea8f16"));
+    }
+
+    /// Captured verbatim from `job/status` against rclone 1.75.1 while an
+    /// `operations/list` was still running. Note `output: null` and the empty
+    /// `error`: neither means anything until `finished` is true.
+    const RUNNING: &str = r#"{
+ "duration": 0,
+ "endTime": "0001-01-01T00:00:00Z",
+ "error": "",
+ "executeId": "00c89e3f-edf1-4b46-9752-3495a965df7e",
+ "finished": false,
+ "group": "job/1",
+ "id": 1,
+ "output": null,
+ "startTime": "2026-09-22T10:30:50.318939+09:00",
+ "success": false
+}"#;
+
+    /// The same call after it failed. `success` is false and the reason is in
+    /// `error`; the HTTP status was 200, so this is the only signal there is.
+    const FAILED: &str = r#"{
+ "duration": 0.00064275,
+ "endTime": "2026-09-22T10:30:24.404089+09:00",
+ "error": "error in ListJSON: directory not found",
+ "executeId": "cd0af5e3-7667-4055-a5eb-690e57003ff3",
+ "finished": true,
+ "group": "job/5",
+ "id": 5,
+ "output": {},
+ "startTime": "2026-09-22T10:30:24.403446+09:00",
+ "success": false
+}"#;
+
+    #[test]
+    fn running_job_carries_no_output_yet() {
+        let status: JobStatus = serde_json::from_str(RUNNING).unwrap();
+        assert!(!status.finished);
+        assert!(status.error.is_empty());
+        assert!(status.output.is_null());
+        // The group is what the stats poll is addressed to; without it there is
+        // nothing to show while waiting.
+        assert_eq!(status.group, "job/1");
+    }
+
+    /// An async failure arrives with HTTP 200 and an `error` string. Reading only
+    /// `output` would turn a failed listing into an empty one, and an empty
+    /// listing quietly means "this scope has no files".
+    #[test]
+    fn failed_job_reports_its_error() {
+        let status: JobStatus = serde_json::from_str(FAILED).unwrap();
+        assert!(status.finished);
+        assert_eq!(status.error, "error in ListJSON: directory not found");
+    }
+
+    #[test]
+    fn successful_job_hands_back_the_synchronous_output() {
+        let json = r#"{"finished":true,"error":"","group":"job/1","success":true,
+            "output":{"list":[{"Path":"a.txt","Size":5,"IsDir":false}]}}"#;
+        let status: JobStatus = serde_json::from_str(json).unwrap();
+        assert!(status.finished);
+        let entries = parse_entries(&status.output["list"].to_string(), "").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "a.txt");
+    }
+
+    /// Captured verbatim from `core/stats` against rclone 1.75.1, mid-listing.
+    /// Most of the response is about transfers and is deliberately ignored.
+    #[test]
+    fn stats_parse_and_ignore_the_transfer_fields() {
+        let json = r#"{
+	"bytes": 0,
+	"checks": 0,
+	"deletedDirs": 0,
+	"deletes": 0,
+	"elapsedTime": 1.464237125,
+	"errors": 0,
+	"eta": null,
+	"fatalError": false,
+	"listed": 92277,
+	"renames": 0,
+	"retryError": false,
+	"serverSideCopies": 0,
+	"serverSideCopyBytes": 0,
+	"serverSideMoveBytes": 0,
+	"serverSideMoves": 0,
+	"speed": 0,
+	"totalBytes": 0,
+	"totalChecks": 0,
+	"totalTransfers": 0,
+	"transferTime": 0,
+	"transfers": 0
+}"#;
+        let stats: JobStats = serde_json::from_str(json).unwrap();
+        assert_eq!(stats.listed, 92_277);
+        assert_eq!(stats.deletes, 0);
+        assert_eq!(stats.errors, 0);
+    }
+
+    /// `deletedDirs` is the one field whose name does not survive a naive
+    /// snake_case mapping, so it gets its own check.
+    #[test]
+    fn stats_map_camel_case_names() {
+        let stats: JobStats =
+            serde_json::from_str(r#"{"listed":3,"deletes":7,"deletedDirs":2,"errors":1}"#).unwrap();
+        assert_eq!(stats.deleted_dirs, 2);
+        assert_eq!(stats.deletes, 7);
+        assert_eq!(stats.errors, 1);
+    }
+
+    /// The listing body is what makes scope handling correct; `remote` carries the
+    /// scope and `fs` stays at the remote root, which is why paths come back
+    /// already prefixed.
+    #[test]
+    fn list_request_puts_the_scope_in_remote_not_fs() {
+        let remote = RcdRemote {
+            remote: "filen:".into(),
+            base_url: String::new(),
+            password: String::new(),
+            http: reqwest::Client::new(),
+            child: None,
+        };
+        let body = remote.list_request("/Photos/2019/");
+        assert_eq!(body["fs"], "filen:");
+        assert_eq!(body["remote"], "Photos/2019");
+        assert_eq!(body["opt"]["recurse"], true);
+        assert_eq!(body["opt"]["hashTypes"][0], HASH_TYPE);
     }
 }

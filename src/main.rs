@@ -16,6 +16,7 @@ use verified_recompress::ledger::{Ledger, State};
 use verified_recompress::pipeline::{self, Pipeline};
 use verified_recompress::policy::{self, Limits, SkipReason};
 use verified_recompress::preflight;
+use verified_recompress::progress;
 use verified_recompress::remote::{Remote, rcd::RcdRemote};
 use verified_recompress::dedup;
 use verified_recompress::report::Projection;
@@ -99,12 +100,23 @@ async fn run_scan(cfg: &Config) -> Result<()> {
     let mut total = 0usize;
     for scope in &scopes {
         let label = if scope.is_empty() { "/" } else { scope };
-        tracing::info!("listing {label}");
-        let entries = remote.list(scope).await?;
+        // One recursive request covers the whole subtree, so without a counter
+        // there is nothing between "listing" and the result but silence.
+        let activity = progress::Activity::start(format!("listing {label}"));
+        let entries = remote
+            .list_progress(scope, |stats| {
+                activity.set(format!(
+                    "listed {} entries",
+                    progress::thousands(stats.listed)
+                ));
+            })
+            .await?;
+        activity.finish();
+
         let bytes: u64 = entries.iter().map(|e| e.size).sum();
         tracing::info!(
             "  {} file(s), {}",
-            entries.len(),
+            progress::thousands(entries.len() as u64),
             format_size(bytes, DECIMAL)
         );
         total += ledger.upsert(entries).await?;
@@ -113,13 +125,17 @@ async fn run_scan(cfg: &Config) -> Result<()> {
     remote.shutdown().await?;
 
     let counts = ledger.counts().await?;
-    println!("Inventoried {total} file(s) across {} scope(s).", scopes.len());
+    println!(
+        "Inventoried {} file(s) across {} scope(s).",
+        progress::thousands(total as u64),
+        scopes.len()
+    );
     println!(
         "  pending {}  done {}  skipped {}  failed {}  total {}",
-        counts.pending,
-        counts.done,
-        counts.skipped,
-        counts.failed,
+        progress::thousands(counts.pending),
+        progress::thousands(counts.done),
+        progress::thousands(counts.skipped),
+        progress::thousands(counts.failed),
         format_size(counts.total_bytes, DECIMAL)
     );
     Ok(())
@@ -337,7 +353,21 @@ async fn run_cleanup(cfg: &Config, execute: bool) -> Result<()> {
         return Ok(());
     }
 
-    remote.cleanup().await?;
+    let activity = progress::Activity::start("emptying the trash");
+    remote
+        .cleanup_progress(|stats| {
+            // Filen may or may not account for this file by file. When it does not
+            // the counter stays put and the elapsed time carries the message.
+            if stats.deletes > 0 {
+                activity.set(format!(
+                    "{} file(s) removed",
+                    progress::thousands(stats.deletes)
+                ));
+            }
+        })
+        .await?;
+    activity.finish();
+
     let reclaimed = ledger.mark_reclaimed().await?;
     let after = remote.about().await.ok().and_then(|a| a.free);
     remote.shutdown().await?;
