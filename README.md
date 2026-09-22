@@ -155,6 +155,12 @@ finding; warnings (such as a missing `taskset` off Linux) do not fail it.
 Lists the remote and records every file in the ledger. Downloads nothing, modifies nothing. Run it
 again whenever the drive changes.
 
+A rescan is a full picture of what it listed, not an addition to it: rows for files that are no
+longer on the remote are dropped, and it says how many. The sweep is scoped the same way the
+listing was, so `scan --path /Photos` never evicts anything under `/Music`. Already-converted
+originals are exempt — this tool put them in the trash itself, so their absence is expected and
+their record is what `report`, `verify` and `restore` run on.
+
 It does **not** record content hashes by default. Asking rclone for them turns a Filen listing
 from seconds into minutes, and nothing in the conversion path needs them: a conversion hashes the
 original itself once the bytes are local, which is a stronger guarantee than taking the backend's
@@ -383,7 +389,7 @@ Other things worth knowing:
 ## Development
 
 ```sh
-cargo test          # 311 tests
+cargo test          # 315 tests
 cargo build --release
 ```
 

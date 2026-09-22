@@ -76,8 +76,9 @@ pub struct Counts {
 /// Commands the actor understands. Each carries a channel for its reply.
 enum Cmd {
     Upsert {
+        scope: String,
         entries: Vec<Entry>,
-        reply: oneshot::Sender<Result<usize>>,
+        reply: oneshot::Sender<Result<Sync>>,
     },
     Get {
         path: String,
@@ -159,6 +160,15 @@ pub struct Conversion {
     pub original_blake3: String,
 }
 
+/// What one listing changed in the inventory.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Sync {
+    /// Files recorded, whether new or already known.
+    pub seen: usize,
+    /// Rows dropped because the file is no longer on the remote.
+    pub removed: usize,
+}
+
 /// Originals sitting in the trash, still counted against the quota.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Reclaim {
@@ -232,8 +242,24 @@ impl Ledger {
     /// Inserts new files and refreshes metadata on known ones. Returns the row count
     /// touched. Files whose size and hash are unchanged keep their state, so a rescan
     /// does not undo completed work.
-    pub async fn upsert(&self, entries: Vec<Entry>) -> Result<usize> {
-        self.send(|reply| Cmd::Upsert { entries, reply }).await
+    /// Records a complete listing of `scope`.
+    ///
+    /// Complete is the operative word: rows under `scope` that this listing did
+    /// not mention are for files that are no longer on the remote, and they are
+    /// dropped. Leaving them makes `plan` count files that are not there and
+    /// `run` claim them, fail to download them, and record the 404 forever.
+    ///
+    /// An empty scope means the whole remote. A scan of `/Photos` says nothing
+    /// about whether `/Music` still exists, so the sweep is scoped the same way
+    /// the listing was.
+    pub async fn sync(&self, scope: &str, entries: Vec<Entry>) -> Result<Sync> {
+        let scope = scope.to_string();
+        self.send(|reply| Cmd::Upsert {
+            scope,
+            entries,
+            reply,
+        })
+        .await
     }
 
     pub async fn get(&self, path: &str) -> Result<Option<FileRow>> {
@@ -397,8 +423,12 @@ fn migrate(conn: &Connection) -> Result<()> {
 fn actor_loop(mut conn: Connection, mut rx: mpsc::Receiver<Cmd>) {
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
-            Cmd::Upsert { entries, reply } => {
-                let _ = reply.send(do_upsert(&mut conn, &entries));
+            Cmd::Upsert {
+                scope,
+                entries,
+                reply,
+            } => {
+                let _ = reply.send(do_sync(&mut conn, &scope, &entries));
             }
             Cmd::Get { path, reply } => {
                 let _ = reply.send(do_get(&conn, &path));
@@ -452,9 +482,18 @@ fn actor_loop(mut conn: Connection, mut rx: mpsc::Receiver<Cmd>) {
     }
 }
 
-fn do_upsert(conn: &mut Connection, entries: &[Entry]) -> Result<usize> {
+fn do_sync(conn: &mut Connection, scope: &str, entries: &[Entry]) -> Result<Sync> {
     let tx = conn.transaction()?;
     let mut count = 0;
+    // Recording what the listing held lets the sweep below be exact rather than
+    // inferred from timestamps, which only have one-second resolution.
+    tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS seen (path TEXT PRIMARY KEY); DELETE FROM seen;")?;
+    {
+        let mut mark = tx.prepare("INSERT OR IGNORE INTO seen (path) VALUES (?1)")?;
+        for entry in entries {
+            mark.execute(params![entry.path])?;
+        }
+    }
     {
         // Re-inventorying must not reset progress. Only when the file actually
         // changed on the remote does it go back to pending for reassessment.
@@ -489,8 +528,31 @@ fn do_upsert(conn: &mut Connection, entries: &[Entry]) -> Result<usize> {
             count += 1;
         }
     }
+
+    // `done` rows are exempt. Their path is the original, which this tool moved
+    // to the trash on purpose once the replacement was confirmed, so absence
+    // from the listing is the expected state. Dropping them would throw away
+    // the only record of what was converted into what.
+    let prefixes = if scope.is_empty() {
+        Vec::new()
+    } else {
+        vec![super::remote::normalize_path(scope)]
+    };
+    let (filter, params) = prefix_filter(&prefixes);
+    let removed = tx.execute(
+        &format!(
+            "DELETE FROM files
+             WHERE state != 'done'{filter}
+               AND path NOT IN (SELECT path FROM seen)"
+        ),
+        rusqlite::params_from_iter(params.iter()),
+    )?;
+
     tx.commit()?;
-    Ok(count)
+    Ok(Sync {
+        seen: count,
+        removed,
+    })
 }
 
 /// A row exactly as stored, before the state text is validated.
@@ -808,7 +870,7 @@ mod tests {
     async fn upsert_then_read_back() {
         let ledger = Ledger::open_in_memory().unwrap();
         ledger
-            .upsert(vec![entry("a.jpg", 100), entry("b/c.png", 200)])
+            .sync("", vec![entry("a.jpg", 100), entry("b/c.png", 200)])
             .await
             .unwrap();
 
@@ -832,10 +894,10 @@ mod tests {
     #[tokio::test]
     async fn rescan_preserves_state_for_unchanged_files() {
         let ledger = Ledger::open_in_memory().unwrap();
-        ledger.upsert(vec![entry("a.jpg", 100)]).await.unwrap();
+        ledger.sync("", vec![entry("a.jpg", 100)]).await.unwrap();
         ledger.set_state("a.jpg", State::Done, None).await.unwrap();
 
-        ledger.upsert(vec![entry("a.jpg", 100)]).await.unwrap();
+        ledger.sync("", vec![entry("a.jpg", 100)]).await.unwrap();
         assert_eq!(ledger.get("a.jpg").await.unwrap().unwrap().state, State::Done);
     }
 
@@ -843,13 +905,13 @@ mod tests {
     #[tokio::test]
     async fn rescan_resets_state_when_size_changes() {
         let ledger = Ledger::open_in_memory().unwrap();
-        ledger.upsert(vec![entry("a.jpg", 100)]).await.unwrap();
+        ledger.sync("", vec![entry("a.jpg", 100)]).await.unwrap();
         ledger
             .set_state("a.jpg", State::Skipped, Some("too_small".into()))
             .await
             .unwrap();
 
-        ledger.upsert(vec![entry("a.jpg", 999)]).await.unwrap();
+        ledger.sync("", vec![entry("a.jpg", 999)]).await.unwrap();
         let row = ledger.get("a.jpg").await.unwrap().unwrap();
         assert_eq!(row.state, State::Pending);
         assert_eq!(row.skip_reason, None, "stale skip reason must be cleared");
@@ -860,7 +922,7 @@ mod tests {
     async fn claim_takes_largest_first() {
         let ledger = Ledger::open_in_memory().unwrap();
         ledger
-            .upsert(vec![entry("small", 1), entry("big", 100), entry("mid", 50)])
+            .sync("", vec![entry("small", 1), entry("big", 100), entry("mid", 50)])
             .await
             .unwrap();
         assert_eq!(ledger.claim_next(&[], Order::Size).await.unwrap().unwrap().path, "big");
@@ -880,7 +942,7 @@ mod tests {
         // 100 * 0.20 = 20 against 70 * 0.35 = 24.5, so the PNG wins on savings
         // while the JPEG wins on size.
         ledger
-            .upsert(vec![entry("a.jpg", 100_000), entry("b.png", 70_000)])
+            .sync("", vec![entry("a.jpg", 100_000), entry("b.png", 70_000)])
             .await
             .unwrap();
 
@@ -889,7 +951,7 @@ mod tests {
 
         let ledger = Ledger::open_in_memory().unwrap();
         ledger
-            .upsert(vec![entry("a.jpg", 100_000), entry("b.png", 70_000)])
+            .sync("", vec![entry("a.jpg", 100_000), entry("b.png", 70_000)])
             .await
             .unwrap();
         let by_savings = ledger
@@ -904,7 +966,7 @@ mod tests {
     async fn path_order_is_lexicographic() {
         let ledger = Ledger::open_in_memory().unwrap();
         ledger
-            .upsert(vec![entry("c.jpg", 300), entry("a.jpg", 100), entry("b.jpg", 200)])
+            .sync("", vec![entry("c.jpg", 300), entry("a.jpg", 100), entry("b.jpg", 200)])
             .await
             .unwrap();
         for expected in ["a.jpg", "b.jpg", "c.jpg"] {
@@ -919,7 +981,7 @@ mod tests {
     async fn unconvertible_files_sort_last_by_savings() {
         let ledger = Ledger::open_in_memory().unwrap();
         ledger
-            .upsert(vec![entry("huge.bin", 9_000_000), entry("small.jpg", 50_000)])
+            .sync("", vec![entry("huge.bin", 9_000_000), entry("small.jpg", 50_000)])
             .await
             .unwrap();
         let first = ledger
@@ -930,12 +992,86 @@ mod tests {
         assert_eq!(first.path, "small.jpg");
     }
 
+    /// A file deleted on the remote has to leave the inventory, or `plan` counts
+    /// it and `run` claims it, fails to download it, and records the 404 forever.
+    #[tokio::test]
+    async fn a_file_gone_from_the_listing_is_dropped() {
+        let ledger = Ledger::open_in_memory().unwrap();
+        ledger
+            .sync("", vec![entry("a.jpg", 100_000), entry("b.jpg", 100_000)])
+            .await
+            .unwrap();
+
+        let synced = ledger.sync("", vec![entry("a.jpg", 100_000)]).await.unwrap();
+        assert_eq!(synced.seen, 1);
+        assert_eq!(synced.removed, 1);
+        assert!(ledger.get("b.jpg").await.unwrap().is_none());
+        assert!(ledger.get("a.jpg").await.unwrap().is_some());
+    }
+
+    /// A converted original is *supposed* to be absent: this tool moved it to the
+    /// trash once the replacement was confirmed. Sweeping it would destroy the
+    /// only record of what was converted into what, and with it the savings
+    /// report and every restore.
+    #[tokio::test]
+    async fn a_converted_original_survives_being_absent() {
+        let ledger = Ledger::open_in_memory().unwrap();
+        ledger.sync("", vec![entry("a.jpg", 100_000)]).await.unwrap();
+        ledger
+            .record_conversion(conversion("a.jpg", 80_000))
+            .await
+            .unwrap();
+
+        // The original is gone from the remote, exactly as intended.
+        let synced = ledger.sync("", vec![]).await.unwrap();
+        assert_eq!(synced.removed, 0, "a done row is not stale, it is finished");
+
+        let done = ledger.completed(None).await.unwrap();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].path, "a.jpg");
+    }
+
+    /// Listing one folder says nothing about another, so the sweep must not
+    /// reach outside what was actually listed.
+    #[tokio::test]
+    async fn the_sweep_stays_inside_the_scanned_scope() {
+        let ledger = Ledger::open_in_memory().unwrap();
+        ledger
+            .sync("", vec![entry("photos/a.jpg", 100_000), entry("music/b.flac", 100_000)])
+            .await
+            .unwrap();
+
+        // Rescan photos only, and find it empty.
+        let synced = ledger.sync("photos", vec![]).await.unwrap();
+        assert_eq!(synced.removed, 1);
+        assert!(ledger.get("photos/a.jpg").await.unwrap().is_none());
+        assert!(
+            ledger.get("music/b.flac").await.unwrap().is_some(),
+            "a scan of photos must not evict music"
+        );
+    }
+
+    /// Prefixes line up with path segments here as they do for claiming, so a
+    /// scan of `photos` cannot sweep `photos-backup`.
+    #[tokio::test]
+    async fn the_sweep_respects_segment_boundaries() {
+        let ledger = Ledger::open_in_memory().unwrap();
+        ledger
+            .sync("", vec![entry("photos/a.jpg", 100_000), entry("photos-backup/a.jpg", 100_000)])
+            .await
+            .unwrap();
+
+        ledger.sync("photos", vec![]).await.unwrap();
+        assert!(ledger.get("photos/a.jpg").await.unwrap().is_none());
+        assert!(ledger.get("photos-backup/a.jpg").await.unwrap().is_some());
+    }
+
     /// The whole point of the single-writer actor: concurrent claims cannot collide.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_claims_never_hand_out_the_same_file() {
         let ledger = Ledger::open_in_memory().unwrap();
         let entries: Vec<_> = (0..200).map(|i| entry(&format!("f{i:03}"), i)).collect();
-        ledger.upsert(entries).await.unwrap();
+        ledger.sync("", entries).await.unwrap();
 
         let mut handles = Vec::new();
         for _ in 0..8 {
@@ -966,7 +1102,7 @@ mod tests {
     async fn claims_are_confined_to_the_given_prefixes() {
         let ledger = Ledger::open_in_memory().unwrap();
         ledger
-            .upsert(vec![
+            .sync("", vec![
                 entry("photos/a.jpg", 100),
                 entry("photos/2019/b.jpg", 90),
                 entry("audio/tone.wav", 80),
@@ -993,7 +1129,7 @@ mod tests {
     async fn a_prefix_does_not_match_a_longer_sibling_directory() {
         let ledger = Ledger::open_in_memory().unwrap();
         ledger
-            .upsert(vec![entry("photos/a.jpg", 10), entry("photos-backup/b.jpg", 20)])
+            .sync("", vec![entry("photos/a.jpg", 10), entry("photos-backup/b.jpg", 20)])
             .await
             .unwrap();
         let scope = vec!["photos".to_string()];
@@ -1009,7 +1145,7 @@ mod tests {
     async fn like_wildcards_in_a_folder_name_are_escaped() {
         let ledger = Ledger::open_in_memory().unwrap();
         ledger
-            .upsert(vec![entry("100%_done/a.jpg", 10), entry("100Xdone/b.jpg", 20)])
+            .sync("", vec![entry("100%_done/a.jpg", 10), entry("100Xdone/b.jpg", 20)])
             .await
             .unwrap();
         let scope = vec!["100%_done".to_string()];
@@ -1024,7 +1160,7 @@ mod tests {
     async fn several_prefixes_are_unioned_in_the_claim() {
         let ledger = Ledger::open_in_memory().unwrap();
         ledger
-            .upsert(vec![
+            .sync("", vec![
                 entry("photos/a.jpg", 30),
                 entry("camera/b.jpg", 20),
                 entry("docs/c.pdf", 10),
@@ -1043,7 +1179,7 @@ mod tests {
     async fn crashed_claims_are_recovered() {
         let ledger = Ledger::open_in_memory().unwrap();
         ledger
-            .upsert(vec![entry("a", 1), entry("b", 2)])
+            .sync("", vec![entry("a", 1), entry("b", 2)])
             .await
             .unwrap();
         ledger.claim_next(&[], Order::Size).await.unwrap();
@@ -1061,7 +1197,7 @@ mod tests {
     async fn settings_dependent_skips_can_be_reopened() {
         let ledger = Ledger::open_in_memory().unwrap();
         ledger
-            .upsert(vec![entry("gated", 1), entry("hdr", 2), entry("big", 3)])
+            .sync("", vec![entry("gated", 1), entry("hdr", 2), entry("big", 3)])
             .await
             .unwrap();
         ledger
@@ -1092,7 +1228,7 @@ mod tests {
     #[tokio::test]
     async fn reopening_clears_the_stale_reason() {
         let ledger = Ledger::open_in_memory().unwrap();
-        ledger.upsert(vec![entry("a", 1)]).await.unwrap();
+        ledger.sync("", vec![entry("a", 1)]).await.unwrap();
         ledger
             .set_state("a", State::Skipped, Some("video_tier_disabled".into()))
             .await
@@ -1104,7 +1240,7 @@ mod tests {
     #[tokio::test]
     async fn reopening_nothing_is_harmless() {
         let ledger = Ledger::open_in_memory().unwrap();
-        ledger.upsert(vec![entry("a", 1)]).await.unwrap();
+        ledger.sync("", vec![entry("a", 1)]).await.unwrap();
         ledger.set_state("a", State::Done, None).await.unwrap();
         assert_eq!(ledger.reopen_skipped(&[]).await.unwrap(), 0);
         assert_eq!(ledger.reopen_skipped(&["video_hdr"]).await.unwrap(), 0);
@@ -1121,7 +1257,7 @@ mod tests {
     async fn counts_break_down_by_state() {
         let ledger = Ledger::open_in_memory().unwrap();
         ledger
-            .upsert(vec![entry("a", 10), entry("b", 20), entry("c", 30)])
+            .sync("", vec![entry("a", 10), entry("b", 20), entry("c", 30)])
             .await
             .unwrap();
         ledger.set_state("a", State::Done, None).await.unwrap();
@@ -1143,7 +1279,7 @@ mod tests {
         let path = dir.path().join("nested").join("ledger.sqlite");
         {
             let ledger = Ledger::open(&path).unwrap();
-            ledger.upsert(vec![entry("a.jpg", 42)]).await.unwrap();
+            ledger.sync("", vec![entry("a.jpg", 42)]).await.unwrap();
             ledger.set_state("a.jpg", State::Done, None).await.unwrap();
         }
         let ledger = Ledger::open(&path).unwrap();
@@ -1164,7 +1300,7 @@ mod tests {
     #[tokio::test]
     async fn recording_a_conversion_marks_it_done_and_stores_the_result() {
         let ledger = Ledger::open_in_memory().unwrap();
-        ledger.upsert(vec![entry("a.jpg", 1000)]).await.unwrap();
+        ledger.sync("", vec![entry("a.jpg", 1000)]).await.unwrap();
         ledger.record_conversion(conversion("a.jpg", 800)).await.unwrap();
 
         let row = ledger.get("a.jpg").await.unwrap().unwrap();
@@ -1183,7 +1319,7 @@ mod tests {
     async fn originals_stay_pending_reclaim_until_the_trash_is_emptied() {
         let ledger = Ledger::open_in_memory().unwrap();
         ledger
-            .upsert(vec![entry("a.jpg", 1000), entry("b.jpg", 500)])
+            .sync("", vec![entry("a.jpg", 1000), entry("b.jpg", 500)])
             .await
             .unwrap();
         ledger.record_conversion(conversion("a.jpg", 800)).await.unwrap();
@@ -1201,7 +1337,7 @@ mod tests {
     #[tokio::test]
     async fn reclaiming_twice_does_not_double_count() {
         let ledger = Ledger::open_in_memory().unwrap();
-        ledger.upsert(vec![entry("a.jpg", 1000)]).await.unwrap();
+        ledger.sync("", vec![entry("a.jpg", 1000)]).await.unwrap();
         ledger.record_conversion(conversion("a.jpg", 800)).await.unwrap();
         assert_eq!(ledger.mark_reclaimed().await.unwrap(), 1000);
         assert_eq!(ledger.mark_reclaimed().await.unwrap(), 0);
@@ -1211,7 +1347,7 @@ mod tests {
     #[tokio::test]
     async fn savings_persist_after_reclaiming() {
         let ledger = Ledger::open_in_memory().unwrap();
-        ledger.upsert(vec![entry("a.jpg", 1000)]).await.unwrap();
+        ledger.sync("", vec![entry("a.jpg", 1000)]).await.unwrap();
         ledger.record_conversion(conversion("a.jpg", 800)).await.unwrap();
         ledger.mark_reclaimed().await.unwrap();
         assert_eq!(ledger.savings().await.unwrap().logical_bytes(), 200);
@@ -1263,8 +1399,8 @@ mod tests {
                     path TEXT PRIMARY KEY, size INTEGER NOT NULL, mod_time TEXT,
                     blake3 TEXT, state TEXT NOT NULL DEFAULT 'pending',
                     skip_reason TEXT, seen_at TEXT NOT NULL DEFAULT (datetime('now')));
-                 INSERT INTO files (path, size) VALUES ('old_small.jpg', 10_000);
-                 INSERT INTO files (path, size) VALUES ('old_big.jpg', 900_000);",
+                 INSERT INTO files (path, size) VALUES ('old/small.jpg', 10_000);
+                 INSERT INTO files (path, size) VALUES ('old/big.jpg', 900_000);",
             )
             .unwrap();
         }
@@ -1272,7 +1408,12 @@ mod tests {
         let ledger = Ledger::open(&path).unwrap();
         // Both migrated rows carry saving 0, so they fall through to the size
         // tiebreaker; a freshly scanned row outranks them on its real estimate.
-        ledger.upsert(vec![entry("fresh.jpg", 500_000)]).await.unwrap();
+        // Scoped to `fresh` so the legacy rows are out of the sweep's reach and
+        // keep their migrated zero.
+        ledger
+            .sync("fresh", vec![entry("fresh/new.jpg", 500_000)])
+            .await
+            .unwrap();
 
         let order: Vec<String> = {
             let mut seen = Vec::new();
@@ -1281,14 +1422,14 @@ mod tests {
             }
             seen
         };
-        assert_eq!(order, ["fresh.jpg", "old_big.jpg", "old_small.jpg"]);
+        assert_eq!(order, ["fresh/new.jpg", "old/big.jpg", "old/small.jpg"]);
     }
 
     #[tokio::test]
     async fn completed_conversions_can_be_listed_and_looked_up() {
         let ledger = Ledger::open_in_memory().unwrap();
         ledger
-            .upsert(vec![entry("a.jpg", 1000), entry("b.jpg", 20), entry("c.jpg", 5)])
+            .sync("", vec![entry("a.jpg", 1000), entry("b.jpg", 20), entry("c.jpg", 5)])
             .await
             .unwrap();
         ledger.record_conversion(conversion("a.jpg", 800)).await.unwrap();
@@ -1310,7 +1451,7 @@ mod tests {
     #[tokio::test]
     async fn a_conversion_is_findable_by_either_path() {
         let ledger = Ledger::open_in_memory().unwrap();
-        ledger.upsert(vec![entry("a.jpg", 100)]).await.unwrap();
+        ledger.sync("", vec![entry("a.jpg", 100)]).await.unwrap();
         ledger.record_conversion(conversion("a.jpg", 80)).await.unwrap();
 
         assert!(ledger.completed_for("a.jpg").await.unwrap().is_some());

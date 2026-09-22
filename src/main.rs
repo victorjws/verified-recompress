@@ -117,6 +117,7 @@ async fn run_scan(cfg: &Config, hash: bool) -> Result<()> {
     };
 
     let mut total = 0usize;
+    let mut removed = 0usize;
     for scope in &scopes {
         let label = if scope.is_empty() { "/" } else { scope };
         // One recursive request covers the whole subtree, so without a counter
@@ -139,7 +140,9 @@ async fn run_scan(cfg: &Config, hash: bool) -> Result<()> {
             progress::thousands(entries.len() as u64),
             format_size(bytes, DECIMAL)
         );
-        total += ledger.upsert(entries).await?;
+        let synced = ledger.sync(scope, entries).await?;
+        total += synced.seen;
+        removed += synced.removed;
     }
 
     remote.shutdown().await?;
@@ -150,6 +153,12 @@ async fn run_scan(cfg: &Config, hash: bool) -> Result<()> {
         progress::thousands(total as u64),
         scopes.len()
     );
+    if removed > 0 {
+        emit!(
+            "  Dropped {} row(s) for files no longer on the remote.",
+            progress::thousands(removed as u64)
+        );
+    }
     emit!(
         "  pending {}  done {}  skipped {}  failed {}  total {}",
         progress::thousands(counts.pending),

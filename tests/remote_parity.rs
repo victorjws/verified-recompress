@@ -243,12 +243,12 @@ async fn listing_feeds_the_ledger_and_rescanning_is_idempotent() {
     let ledger = Ledger::open_in_memory().unwrap();
 
     let entries = fx.cli().list("", Hashes::Skip).await.unwrap();
-    assert_eq!(ledger.upsert(entries.clone()).await.unwrap(), 3);
+    assert_eq!(ledger.sync("", entries.clone()).await.unwrap().seen, 3);
     assert_eq!(ledger.counts().await.unwrap().pending, 3);
 
     // Mark one done, then rescan: the verdict must stick.
     ledger.set_state("a.txt", State::Done, None).await.unwrap();
-    ledger.upsert(entries).await.unwrap();
+    ledger.sync("", entries).await.unwrap();
 
     let counts = ledger.counts().await.unwrap();
     assert_eq!(counts.done, 1);
