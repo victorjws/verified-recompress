@@ -65,6 +65,12 @@ impl RcdRemote {
         let mut cmd = Command::new("rclone");
         cmd.args([
             "rcd",
+            // Without this rclone walks a recursive listing one directory at a
+            // time. Filen implements ListR, so the whole subtree arrives in a
+            // single request instead of one round trip per folder. The flag is
+            // global rather than a per-call option, which is why it has to be
+            // set here; `CliRemote` passes the same flag to `lsjson`.
+            "--fast-list",
             "--rc-addr",
             &addr,
             "--rc-user",
@@ -91,7 +97,26 @@ impl RcdRemote {
             child: Some(child),
         };
         this.await_ready().await?;
+        this.confirm_fast_list().await?;
         Ok(this)
+    }
+
+    /// Fails loudly if recursive listing did not actually get enabled.
+    ///
+    /// Worth a round trip because the symptom otherwise is not an error: the
+    /// listing still returns the right answer, just one request per directory,
+    /// which on a real drive is the difference between seconds and minutes.
+    /// `_config` overrides silently ignore names they do not recognise, so a
+    /// renamed field would regress this invisibly.
+    async fn confirm_fast_list(&self) -> Result<()> {
+        let value = self.call("options/get", json!({})).await?;
+        if uses_list_r(&value) {
+            return Ok(());
+        }
+        bail!(
+            "rclone did not accept --fast-list, so every listing would walk one \
+             directory at a time; check the rclone version on PATH"
+        )
     }
 
     async fn await_ready(&self) -> Result<()> {
@@ -468,6 +493,15 @@ impl Remote for RcdRemote {
     }
 }
 
+/// Reads `UseListR` out of an `options/get` response.
+fn uses_list_r(options: &Value) -> bool {
+    options
+        .get("main")
+        .and_then(|main| main.get("UseListR"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// Doubles the poll wait up to [`POLL_MAX`].
 fn backoff(wait: Duration) -> Duration {
     wait.saturating_mul(2).min(POLL_MAX)
@@ -565,6 +599,23 @@ mod tests {
             steps <= 8,
             "took {steps} steps and {total:?} to reach the cap"
         );
+    }
+
+    /// Captured from `options/get` against rclone 1.75.1. The flag lives in the
+    /// `main` block under a different name than the command line uses.
+    #[test]
+    fn fast_list_is_read_from_the_options_block() {
+        let on = serde_json::json!({"main": {"UseListR": true, "Checkers": 8}});
+        assert!(uses_list_r(&on));
+
+        let off = serde_json::json!({"main": {"UseListR": false}});
+        assert!(!uses_list_r(&off), "this is the default, and it is the slow path");
+
+        // Anything unexpected has to read as "not enabled" rather than passing by
+        // default, or the check would not catch the case it exists for.
+        assert!(!uses_list_r(&serde_json::json!({"main": {}})));
+        assert!(!uses_list_r(&serde_json::json!({})));
+        assert!(!uses_list_r(&serde_json::json!({"main": {"UseListR": "yes"}})));
     }
 
     #[test]
