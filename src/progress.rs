@@ -24,6 +24,27 @@ const TICK: Duration = Duration::from_millis(100);
 /// the run is alive, rare enough not to bury the real output in a CI log.
 const LOG_EVERY: Duration = Duration::from_secs(15);
 
+/// The spinner currently on screen, if any.
+///
+/// A global because the log writer has to find it from anywhere: a line written
+/// while the spinner is mid-redraw would otherwise land on top of it, which is
+/// exactly what happens under `-vv` when the poll loop traces every request.
+static ACTIVE: Mutex<Option<ProgressBar>> = Mutex::new(None);
+
+/// Runs `f` with any active spinner cleared, restoring it afterwards.
+///
+/// Falls through to running `f` directly if the registry is busy. Losing the
+/// clear costs one smudged line; blocking on it could deadlock the logger.
+pub fn suspend<R>(f: impl FnOnce() -> R) -> R {
+    match ACTIVE.try_lock() {
+        Ok(guard) => match guard.as_ref() {
+            Some(bar) => bar.suspend(f),
+            None => f(),
+        },
+        Err(_) => f(),
+    }
+}
+
 /// A long-running step, shown as a spinner with a counter and elapsed time.
 pub struct Activity {
     bar: ProgressBar,
@@ -51,6 +72,10 @@ impl Activity {
         bar.set_message("working");
         bar.enable_steady_tick(TICK);
 
+        // After the label is logged, so `start` cannot suspend a bar it is still
+        // in the middle of creating.
+        *ACTIVE.lock().unwrap_or_else(PoisonError::into_inner) = Some(bar.clone());
+
         Self {
             bar,
             last_log: Mutex::new(Instant::now()),
@@ -74,6 +99,7 @@ impl Activity {
     /// Clears the spinner line. Call before printing anything else, or the
     /// redraw and the output fight over the same line.
     pub fn finish(&self) {
+        *ACTIVE.lock().unwrap_or_else(PoisonError::into_inner) = None;
         self.bar.finish_and_clear();
     }
 
@@ -142,6 +168,18 @@ mod tests {
             activity.due_to_log(start + LOG_EVERY + LOG_EVERY),
             "another full interval later it should log again"
         );
+    }
+
+    /// `suspend` has to work whether or not anything is on screen, because the
+    /// log writer calls it for every line the process ever emits.
+    #[test]
+    fn suspend_runs_the_write_either_way() {
+        assert_eq!(suspend(|| 7), 7, "with no spinner registered");
+
+        let activity = Activity::start("listing /");
+        assert_eq!(suspend(|| 7), 7, "with one registered");
+        activity.finish();
+        assert_eq!(suspend(|| 7), 7, "and after it is cleared");
     }
 
     /// Nothing about updating an [`Activity`] may depend on there being a

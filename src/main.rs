@@ -125,12 +125,12 @@ async fn run_scan(cfg: &Config) -> Result<()> {
     remote.shutdown().await?;
 
     let counts = ledger.counts().await?;
-    println!(
+    tracing::info!(
         "Inventoried {} file(s) across {} scope(s).",
         progress::thousands(total as u64),
         scopes.len()
     );
-    println!(
+    tracing::info!(
         "  pending {}  done {}  skipped {}  failed {}  total {}",
         progress::thousands(counts.pending),
         progress::thousands(counts.done),
@@ -149,7 +149,7 @@ async fn run_plan(cfg: &Config) -> Result<()> {
     let ledger = Ledger::open(&cfg.staging_dir.join("ledger.sqlite"))?;
     let rows = ledger.list_by_state(State::Pending).await?;
     if rows.is_empty() {
-        println!("No pending files. Run `scan` first.");
+        tracing::info!("No pending files. Run `scan` first.");
         return Ok(());
     }
 
@@ -167,8 +167,8 @@ async fn run_plan(cfg: &Config) -> Result<()> {
         projection.record(policy::decide(facts, limits), row.size);
     }
 
-    println!("{} pending file(s) in the inventory.\n", rows.len());
-    print!("{projection}");
+    tracing::info!("{} pending file(s) in the inventory.\n", rows.len());
+    tracing::info!("{}", projection.to_string().trim_end());
     Ok(())
 }
 
@@ -239,7 +239,7 @@ async fn run_convert(cfg: &Config, args: &RunArgs) -> Result<()> {
     ));
 
     if !args.execute {
-        println!("Dry run: nothing on the remote will be written or deleted.\n");
+        tracing::info!("Dry run: nothing on the remote will be written or deleted.\n");
     }
 
     let summary = pipeline
@@ -266,7 +266,7 @@ async fn run_convert(cfg: &Config, args: &RunArgs) -> Result<()> {
     }
 
     let verb = if args.execute { "Converted" } else { "Would convert" };
-    println!(
+    tracing::info!(
         "{verb} {} file(s): {} -> {}, saving {} ({:.0}%)",
         summary.converted,
         format_size(summary.input_bytes, DECIMAL),
@@ -278,13 +278,13 @@ async fn run_convert(cfg: &Config, args: &RunArgs) -> Result<()> {
             summary.saved_bytes() as f64 / summary.input_bytes as f64 * 100.0
         },
     );
-    println!("  skipped {}  failed {}", summary.skipped, summary.failed);
+    tracing::info!("  skipped {}  failed {}", summary.skipped, summary.failed);
 
     if args.execute && trash::purges_after_run(cfg.trash_policy) {
-        println!("\nEmptying the trash as configured (trash_policy = purge_now)...");
+        tracing::info!("\nEmptying the trash as configured (trash_policy = purge_now)...");
         run_cleanup(cfg, true).await?;
     } else if args.execute && cfg.trash_policy == TrashPolicy::Keep {
-        println!(
+        tracing::info!(
             "\n  Originals are in the trash, which still counts against your quota.\n  \
              Check the results, then run `cleanup --execute` to reclaim the space."
         );
@@ -313,26 +313,28 @@ async fn run_report(cfg: &Config) -> Result<()> {
         }
     };
 
-    println!(
+    tracing::info!(
         "Inventory: {} pending, {} done, {} skipped, {} failed",
         counts.pending, counts.done, counts.skipped, counts.failed
     );
-    println!("\nConverted {} file(s)", savings.files);
-    println!(
+    tracing::info!("\nConverted {} file(s)", savings.files);
+    tracing::info!(
         "  {:>12} in  ->  {:>12} out",
         format_size(savings.original_bytes, DECIMAL),
         format_size(savings.output_bytes, DECIMAL)
     );
-    print!(
+    tracing::info!(
         "{}",
         trash::Accounting {
             logical: savings.logical_bytes(),
             pending,
             remote_free,
         }
+        .to_string()
+        .trim_end()
     );
     if let Some(advice) = trash::advice(cfg.trash_policy, pending) {
-        println!("\n  {advice}");
+        tracing::info!("\n  {advice}");
     }
     Ok(())
 }
@@ -346,12 +348,12 @@ async fn run_cleanup(cfg: &Config, execute: bool) -> Result<()> {
     let before = remote.about().await.ok().and_then(|a| a.free);
 
     if !execute {
-        println!(
+        tracing::info!(
             "Would empty the trash, releasing {} held by {} replaced original(s).",
             format_size(pending.bytes, DECIMAL),
             pending.files
         );
-        println!(
+        tracing::info!(
             "\n  This is irreversible: once purged, the originals can no longer be \n  \
              restored from the Filen web app. Re-run with --execute to proceed."
         );
@@ -378,13 +380,13 @@ async fn run_cleanup(cfg: &Config, execute: bool) -> Result<()> {
     let after = remote.about().await.ok().and_then(|a| a.free);
     remote.shutdown().await?;
 
-    println!(
+    tracing::info!(
         "Emptied the trash. {} of originals released.",
         format_size(reclaimed, DECIMAL)
     );
     if let (Some(before), Some(after)) = (before, after) {
         let gained = after.saturating_sub(before);
-        println!(
+        tracing::info!(
             "  Remote free space: {} -> {} ({} recovered)",
             format_size(before, DECIMAL),
             format_size(after, DECIMAL),
@@ -393,7 +395,7 @@ async fn run_cleanup(cfg: &Config, execute: bool) -> Result<()> {
         // A large discrepancy means something else is holding space: an older
         // trash, file versions, or uploads this ledger does not know about.
         if reclaimed > 0 && gained * 2 < reclaimed {
-            println!(
+            tracing::info!(
                 "\n  The drive freed noticeably less than the ledger expected. \n  \
                  Other things may be occupying the trash, or old file versions may \n  \
                  be retained separately."
@@ -419,7 +421,7 @@ async fn run_bench(cfg: &Config, sample: usize) -> Result<()> {
         .collect();
 
     if candidates.is_empty() {
-        println!("No pending video files to benchmark. Run `scan` first.");
+        tracing::info!("No pending video files to benchmark. Run `scan` first.");
         return Ok(());
     }
 
@@ -429,7 +431,7 @@ async fn run_bench(cfg: &Config, sample: usize) -> Result<()> {
     let mut report = bench::Report::default();
 
     for (index, row) in candidates.iter().enumerate() {
-        println!("\nSample {}/{}: {}", index + 1, candidates.len(), row.path);
+        tracing::info!("\nSample {}/{}: {}", index + 1, candidates.len(), row.path);
         let local = work.path().join(format!("sample{index}.bin"));
         remote.download(&row.path, &local).await?;
 
@@ -449,8 +451,8 @@ async fn run_bench(cfg: &Config, sample: usize) -> Result<()> {
     }
 
     remote.shutdown().await?;
-    println!("\n{report}");
-    println!(
+    tracing::info!("\n{report}");
+    tracing::info!(
         "  VMAF alone cannot see oversmoothing. Before settling on a preset, pull a\n           few frames from each and look at them, and diff the metadata with:\n             exiftool -a -G1 <original> <converted>\n           Tags worth checking: {}",
         bench::tracked_tags().join(", ")
     );
@@ -469,10 +471,10 @@ async fn run_dedup(cfg: &Config) -> Result<()> {
     rows.retain(|row| scope.allows(&row.path));
 
     if rows.is_empty() {
-        println!("Nothing in the inventory. Run `scan` first.");
+        tracing::info!("Nothing in the inventory. Run `scan` first.");
         return Ok(());
     }
-    print!("{}", dedup::find(&rows));
+    tracing::info!("{}", dedup::find(&rows).to_string().trim_end());
     Ok(())
 }
 
@@ -486,7 +488,7 @@ async fn run_verify(cfg: &Config, sample: Option<usize>) -> Result<()> {
     let ledger = Ledger::open(&cfg.staging_dir.join("ledger.sqlite"))?;
     let records = ledger.completed(sample).await?;
     if records.is_empty() {
-        println!("No completed conversions to verify.");
+        tracing::info!("No completed conversions to verify.");
         return Ok(());
     }
 
@@ -498,21 +500,21 @@ async fn run_verify(cfg: &Config, sample: Option<usize>) -> Result<()> {
         match verify_one(&remote, record, work.path()).await {
             Ok(true) => {
                 proven += 1;
-                println!("  rebuilt  {}", record.path);
+                tracing::info!("  rebuilt  {}", record.path);
             }
             Ok(false) => {
                 present += 1;
-                println!("  present  {} ({})", record.output_path, record.fidelity);
+                tracing::info!("  present  {} ({})", record.output_path, record.fidelity);
             }
             Err(e) => {
                 failed += 1;
-                println!("  FAILED   {}: {e:#}", record.output_path);
+                tracing::info!("  FAILED   {}: {e:#}", record.output_path);
             }
         }
     }
 
     remote.shutdown().await?;
-    println!(
+    tracing::info!(
         "\n{proven} rebuilt to the original bytes, {present} confirmed present, {failed} failed."
     );
     if failed > 0 {
@@ -575,7 +577,7 @@ async fn run_restore(cfg: &Config, path: &str, execute: bool) -> Result<()> {
     restore::confirm(&record, &rebuilt).await?;
 
     if !execute {
-        println!(
+        tracing::info!(
             "{} rebuilds from {} exactly ({} bytes).\n\n  \
              Re-run with --execute to put it back; the converted file is left in place.",
             record.path, record.output_path, record.original_size
@@ -591,7 +593,7 @@ async fn run_restore(cfg: &Config, path: &str, execute: bool) -> Result<()> {
     remote.upload(&rebuilt, &record.path).await?;
     remote.shutdown().await?;
 
-    println!(
+    tracing::info!(
         "Restored {} from {}. The converted file is still there; remove it yourself \n  \
          once you are satisfied.",
         record.path, record.output_path
@@ -601,11 +603,38 @@ async fn run_restore(cfg: &Config, path: &str, execute: bool) -> Result<()> {
 
 async fn run_preflight(cfg: &Config) -> Result<()> {
     let report = preflight::run(cfg).await?;
-    print!("{report}");
+    tracing::info!("{}", report.to_string().trim_end());
     if report.has_errors() {
         bail!("preflight failed");
     }
     Ok(())
+}
+
+/// Writes log lines to stderr, stepping around the spinner if one is up.
+///
+/// Everything this tool says goes through `tracing`, including results, so the
+/// stream has to be the one the spinner draws on or a redirect would capture
+/// half the run. That makes collisions possible — under `-vv` the poll loop
+/// traces a request every 20ms while the spinner redraws every 100ms — so each
+/// write clears the spinner first.
+struct LogWriter;
+
+impl std::io::Write for LogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        progress::suspend(|| std::io::stderr().write(buf))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::stderr().flush()
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogWriter {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        Self
+    }
 }
 
 fn init_tracing(verbose: u8) {
@@ -619,5 +648,6 @@ fn init_tracing(verbose: u8) {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default)),
         )
         .with_target(false)
+        .with_writer(LogWriter)
         .init();
 }

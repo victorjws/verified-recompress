@@ -41,9 +41,10 @@ impl CliRemote {
     /// Runs rclone, returning stdout plus the exit code so callers can tell apart
     /// "the object is not there" from "rclone could not answer".
     async fn run_raw(&self, args: &[&str]) -> Result<(i32, String)> {
-        let output = self
-            .command()
-            .args(args)
+        let mut cmd = self.command();
+        cmd.args(args);
+        tracing::debug!("run {}", crate::proc::describe(cmd.as_std()));
+        let output = cmd
             .output()
             .await
             .context("failed to execute rclone; is it installed and on PATH?")?;

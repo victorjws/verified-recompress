@@ -85,6 +85,8 @@ impl RcdRemote {
             cmd.env("RCLONE_CONFIG", path);
         }
 
+        // `describe` masks --rc-pass; the line is otherwise exactly what ran.
+        tracing::debug!("spawn {}", crate::proc::describe(cmd.as_std()));
         let child = cmd
             .spawn()
             .context("failed to start `rclone rcd`; is rclone installed and on PATH?")?;
@@ -137,6 +139,14 @@ impl RcdRemote {
 
     /// POSTs to one rc method and returns its JSON body.
     async fn call(&self, method: &str, body: Value) -> Result<Value> {
+        // Polling: the readiness loop and the job loop ask these up to fifty
+        // times a second, so at debug they would bury everything else. They are
+        // still there under -vv.
+        if matches!(method, "core/version" | "job/status" | "core/stats") {
+            tracing::trace!("rc {method} {body}");
+        } else {
+            tracing::debug!("rc {method} {body}");
+        }
         let response = self
             .http
             .post(format!("{}/{method}", self.base_url))

@@ -162,7 +162,10 @@ type Captured = Option<String>;
 ///
 /// Both streams are merged because tools disagree about where version banners go.
 async fn capture(program: &str, args: &[&str]) -> Captured {
-    let output = Command::new(program).args(args).output().await.ok()?;
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    tracing::debug!("run {}", crate::proc::describe(cmd.as_std()));
+    let output = cmd.output().await.ok()?;
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
     Some(text)

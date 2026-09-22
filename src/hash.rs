@@ -74,10 +74,10 @@ pub async fn blake3_file(path: &Path) -> Result<String> {
 }
 
 async fn run_ffmpeg(args: &[&str], path: &Path) -> Result<String> {
-    let output = Command::new("ffmpeg")
-        .args(["-v", "error", "-i"])
-        .arg(path)
-        .args(args)
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-v", "error", "-i"]).arg(path).args(args);
+    tracing::debug!("run {}", crate::proc::describe(cmd.as_std()));
+    let output = cmd
         .output()
         .await
         .context("failed to execute ffmpeg")?;
@@ -116,15 +116,17 @@ pub async fn pcm_md5(path: &Path) -> Result<String> {
 
 /// Number of video frames, used to catch packets silently dropped in a remux.
 pub async fn video_frame_count(path: &Path) -> Result<u64> {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v", "error",
-            "-select_streams", "v:0",
-            "-count_packets",
-            "-show_entries", "stream=nb_read_packets",
-            "-of", "csv=p=0",
-        ])
-        .arg(path)
+    let mut cmd = Command::new("ffprobe");
+    cmd.args([
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-count_packets",
+        "-show_entries", "stream=nb_read_packets",
+        "-of", "csv=p=0",
+    ])
+    .arg(path);
+    tracing::debug!("run {}", crate::proc::describe(cmd.as_std()));
+    let output = cmd
         .output()
         .await
         .context("failed to execute ffprobe")?;

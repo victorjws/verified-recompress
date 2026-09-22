@@ -16,6 +16,7 @@ pub mod ledger;
 pub mod pipeline;
 pub mod policy;
 pub mod preflight;
+pub mod proc;
 pub mod progress;
 pub mod remote;
 pub mod report;

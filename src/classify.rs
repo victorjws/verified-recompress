@@ -224,16 +224,18 @@ pub fn parse_probe(json: &str) -> Result<MediaProbe> {
 
 /// Runs `ffprobe` against a local file.
 pub async fn probe_file(path: &Path) -> Result<MediaProbe> {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-        ])
-        .arg(path)
+    let mut cmd = Command::new("ffprobe");
+    cmd.args([
+        "-v",
+        "error",
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+    ])
+    .arg(path);
+    tracing::debug!("run {}", crate::proc::describe(cmd.as_std()));
+    let output = cmd
         .output()
         .await
         .context("failed to execute ffprobe")?;

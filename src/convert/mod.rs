@@ -212,6 +212,7 @@ fn taskset_available() -> bool {
 
 /// Runs a command, failing with its stderr attached.
 pub(crate) async fn run(mut cmd: Command, what: &str) -> Result<()> {
+    tracing::debug!("run {}", crate::proc::describe(cmd.as_std()));
     let output = cmd
         .output()
         .await

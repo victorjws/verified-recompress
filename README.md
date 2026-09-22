@@ -118,6 +118,17 @@ verified-recompress run --path /Videos --allow-video --preset 4 --execute
 
 ## Commands
 
+Everything the tool says — results included — goes through the log on **stderr**; nothing is
+written to stdout. One redirect therefore captures a whole run:
+
+```sh
+verified-recompress scan 2> scan.log
+```
+
+`-v` adds every external command and rclone API call that was actually issued, which is the first
+thing to look at when a step is slower than it should be. `-vv` adds the polling traffic on top.
+The rc password is masked. Output examples below omit the timestamp and level prefix.
+
 Global flags work with every subcommand:
 
 | Flag | Meaning |
@@ -356,7 +367,7 @@ Other things worth knowing:
 ## Development
 
 ```sh
-cargo test          # 300 tests
+cargo test          # 306 tests
 cargo build --release
 ```
 
