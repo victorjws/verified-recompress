@@ -118,16 +118,22 @@ verified-recompress run --path /Videos --allow-video --preset 4 --execute
 
 ## Commands
 
-Everything the tool says — results included — goes through the log on **stderr**; nothing is
-written to stdout. One redirect therefore captures a whole run:
+Each command's **results go to stdout** with no log decoration, so they pipe:
 
 ```sh
-verified-recompress scan 2> scan.log
+verified-recompress plan | grep saving
 ```
 
-`-v` adds every external command and rclone API call that was actually issued, which is the first
-thing to look at when a step is slower than it should be. `-vv` adds the polling traffic on top.
-The rc password is masked. Output examples below omit the timestamp and level prefix.
+Everything else — progress, the spinner, advice, and every external command and rclone API call
+that was actually issued — is a diagnostic and goes to the log on **stderr**:
+
+```sh
+verified-recompress scan 2> scan.log     # the log
+verified-recompress scan &> run.log      # log and results together
+```
+
+`-v` turns on the command log, which is the first thing to look at when a step is slower than it
+should be. `-vv` adds the polling traffic on top. The rc password is masked in both.
 
 Global flags work with every subcommand:
 
