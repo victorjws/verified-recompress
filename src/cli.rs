@@ -114,6 +114,12 @@ pub struct RunArgs {
     #[arg(long)]
     pub limit: Option<usize>,
 
+    /// Try previously failed files again. Failures are not retried on their own,
+    /// because most are a property of the file; use this after fixing whatever
+    /// went wrong.
+    #[arg(long)]
+    pub retry_failed: bool,
+
     /// Local scratch directory.
     #[arg(long, value_name = "DIR")]
     pub staging_dir: Option<PathBuf>,

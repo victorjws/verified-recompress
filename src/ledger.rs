@@ -120,6 +120,9 @@ enum Cmd {
     RecoverClaimed {
         reply: oneshot::Sender<Result<usize>>,
     },
+    RetryFailed {
+        reply: oneshot::Sender<Result<usize>>,
+    },
     ReopenSkipped {
         reasons: Vec<String>,
         reply: oneshot::Sender<Result<usize>>,
@@ -367,6 +370,17 @@ impl Ledger {
     /// Used when a setting changes that could alter the verdict, so that enabling
     /// the video tier or raising the size cap actually reconsiders the files those
     /// limits excluded, instead of leaving them skipped forever.
+    /// Returns every failed file to `pending`, so a run can try them again.
+    ///
+    /// Failures are not reopened on their own: most are a property of the file
+    /// and retrying them every run would download and re-encode the same things
+    /// forever. But some are not — a daemon that died, a machine that ran out of
+    /// memory — and those leave rows that will never be looked at again without
+    /// this.
+    pub async fn retry_failed(&self) -> Result<usize> {
+        self.send(|reply| Cmd::RetryFailed { reply }).await
+    }
+
     pub async fn reopen_skipped(&self, reasons: &[&str]) -> Result<usize> {
         let reasons = reasons.iter().map(|r| r.to_string()).collect();
         self.send(|reply| Cmd::ReopenSkipped { reasons, reply }).await
@@ -528,6 +542,9 @@ fn actor_loop(mut conn: Connection, mut rx: mpsc::Receiver<Cmd>) {
             }
             Cmd::RecoverClaimed { reply } => {
                 let _ = reply.send(do_recover_claimed(&conn));
+            }
+            Cmd::RetryFailed { reply } => {
+                let _ = reply.send(do_retry_failed(&conn));
             }
             Cmd::ReopenSkipped { reasons, reply } => {
                 let _ = reply.send(do_reopen_skipped(&conn, &reasons));
@@ -824,6 +841,14 @@ fn do_recover_claimed(conn: &Connection) -> Result<usize> {
     Ok(n)
 }
 
+fn do_retry_failed(conn: &Connection) -> Result<usize> {
+    let n = conn.execute(
+        "UPDATE files SET state = 'pending', skip_reason = NULL WHERE state = 'failed'",
+        [],
+    )?;
+    Ok(n)
+}
+
 fn do_reopen_skipped(conn: &Connection, reasons: &[String]) -> Result<usize> {
     if reasons.is_empty() {
         return Ok(0);
@@ -1100,6 +1125,40 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(first.path, "small.jpg");
+    }
+
+    /// A daemon that died or a machine that ran out of memory leaves rows that
+    /// nothing reopens on its own, because most failures are a property of the
+    /// file and retrying them every run would repeat the same work forever.
+    #[tokio::test]
+    async fn failed_files_can_be_returned_for_another_try() {
+        let ledger = Ledger::open_in_memory().unwrap();
+        ledger
+            .sync("", vec![entry("a.jpg", 100_000), entry("b.jpg", 100_000)])
+            .await
+            .unwrap();
+        ledger
+            .set_state("a.jpg", State::Failed, Some("cjxl killed by signal 9".into()))
+            .await
+            .unwrap();
+        ledger
+            .set_state("b.jpg", State::Skipped, Some("no_gain".into()))
+            .await
+            .unwrap();
+
+        assert_eq!(ledger.retry_failed().await.unwrap(), 1);
+
+        let a = ledger.get("a.jpg").await.unwrap().unwrap();
+        assert_eq!(a.state, State::Pending);
+        assert_eq!(a.skip_reason, None, "the old error must not linger");
+
+        // A deliberate skip is not a failure and is left where it is.
+        assert_eq!(
+            ledger.get("b.jpg").await.unwrap().unwrap().state,
+            State::Skipped
+        );
+
+        assert_eq!(ledger.retry_failed().await.unwrap(), 0, "nothing left to retry");
     }
 
     /// A file deleted on the remote has to leave the inventory, or `plan` counts

@@ -235,6 +235,11 @@ async fn run_convert(cfg: &Config, args: &RunArgs) -> Result<()> {
     // Skips caused by this run's settings, rather than by the files themselves,
     // have to be reconsidered when those settings change. Otherwise turning on
     // --allow-video would silently do nothing to files it had already excluded.
+    if args.retry_failed {
+        let retried = ledger.retry_failed().await?;
+        tracing::info!("returning {retried} previously failed file(s) to pending");
+    }
+
     let mut reopen = SkipReason::reopened_by(args.allow_video);
     reopen.push(pipeline::OUT_OF_SCOPE);
     let reopened = ledger.reopen_skipped(&reopen).await?;

@@ -362,13 +362,38 @@ pub(crate) async fn run_with_progress(
         .with_context(|| format!("failed to wait on {what}"))?;
     let errors = collect.await.unwrap_or_default();
     if !status.success() {
-        bail!(
-            "{what} failed (exit {}): {}",
-            status.code().unwrap_or(-1),
-            errors.trim()
-        );
+        bail!("{what} failed ({}): {}", describe_exit(status), errors.trim());
     }
     Ok(())
+}
+
+/// How a process ended, in words.
+///
+/// `ExitStatus::code` is `None` when the process was killed by a signal, and
+/// reporting that as `-1` reads like an exit code the tool chose to return. The
+/// difference matters: a non-zero exit is the encoder rejecting the file, while
+/// a signal is something outside it deciding the process should stop — on a
+/// machine running several encoders at once, usually the out-of-memory killer.
+pub(crate) fn describe_exit(status: std::process::ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        return format!("exit {code}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            // 9 is SIGKILL, which nothing sends politely.
+            let hint = if signal == 9 {
+                " — nothing asks for this politely, so it is usually the \
+                 out-of-memory killer. Lower --cpu-cores to run fewer encoders \
+                 at once"
+            } else {
+                ""
+            };
+            return format!("killed by signal {signal}{hint}");
+        }
+    }
+    "terminated without an exit code".to_string()
 }
 
 /// Runs a command, failing with its stderr attached.
@@ -380,8 +405,8 @@ pub(crate) async fn run(mut cmd: Command, what: &str) -> Result<()> {
         .with_context(|| format!("failed to execute {what}"))?;
     if !output.status.success() {
         bail!(
-            "{what} failed (exit {}): {}",
-            output.status.code().unwrap_or(-1),
+            "{what} failed ({}): {}",
+            describe_exit(output.status),
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
@@ -397,6 +422,32 @@ pub(crate) async fn try_run(mut cmd: Command) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_signal_death_is_not_reported_as_an_exit_code() {
+        use std::process::ExitStatus;
+
+        assert_eq!(describe_exit(ExitStatus::default()), "exit 0");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            let killed = describe_exit(ExitStatus::from_raw(9));
+            assert!(killed.contains("signal 9"), "{killed}");
+            assert!(!killed.contains("exit"), "{killed}");
+            assert!(killed.contains("out-of-memory"), "{killed}");
+
+            let quit = describe_exit(ExitStatus::from_raw(15));
+            assert!(quit.contains("signal 15"), "{quit}");
+            assert!(
+                !quit.contains("out-of-memory"),
+                "only SIGKILL earns that hint"
+            );
+
+            // A real non-zero exit still reads as one.
+            assert_eq!(describe_exit(ExitStatus::from_raw(1 << 8)), "exit 1");
+        }
+    }
 
     #[test]
     fn fidelity_names_are_stable() {

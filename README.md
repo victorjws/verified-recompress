@@ -251,6 +251,7 @@ nothing to the remote.
 | --- | --- |
 | `--execute` | actually modify the remote |
 | `--all` | required for an `--execute` run with no `--path` |
+| `--retry-failed` | return previously failed files to pending and try them again |
 | `--allow-video` | permit the irreversible AV1 tier |
 | `--limit N` | stop after N files |
 | `--staging-dir DIR` | local scratch directory |
@@ -308,6 +309,31 @@ it holds files past the end of the run that put them there. The budget does acco
 for the original staying on disk longer than it otherwise would: recipes that
 normally drop their source before verification reserve one extra copy while this is
 on.
+
+#### When files fail
+
+A failure records the error against the file and leaves it at `failed`. They are
+not retried on their own: most are a property of the file, and re-running them
+every time would fetch and re-encode the same things forever. `--retry-failed`
+returns them to pending once you have dealt with whatever went wrong.
+
+```sh
+sqlite3 <staging_dir>/ledger.sqlite \
+  "SELECT substr(skip_reason,1,80), count(*) FROM files WHERE state='failed' GROUP BY 1;"
+```
+
+Two failures are worth recognising, because they are about the machine rather
+than the file:
+
+`killed by signal 9` means something stopped the encoder rather than the encoder
+rejecting the file — with several running at once, almost always the
+out-of-memory killer. `cjxl` at maximum effort is memory-hungry on large images.
+Lower `--cpu-cores` to run fewer at a time.
+
+`the rclone daemon is not answering` means the same thing happened to rclone, and
+every call after it will fail too. Both point at memory pressure; neither is a
+reason to distrust the files themselves, so `--retry-failed` is the right
+response once there is room.
 
 #### When the remote is nearly full
 
@@ -509,7 +535,7 @@ Other things worth knowing:
 ## Development
 
 ```sh
-cargo test          # 361 tests
+cargo test          # 363 tests
 cargo build --release
 ```
 

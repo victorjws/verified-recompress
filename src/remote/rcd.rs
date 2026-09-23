@@ -156,7 +156,14 @@ impl RcdRemote {
             .json(&body)
             .send()
             .await
-            .with_context(|| format!("rc call {method} could not be sent"))?;
+            .with_context(|| {
+                format!(
+                    "rc call {method} could not be sent; the rclone daemon is not \
+                     answering and has most likely exited. On a machine running \
+                     several encoders at once that is usually the out-of-memory \
+                     killer taking whichever process was largest"
+                )
+            })?;
 
         let status = response.status();
         let value: Value = response
