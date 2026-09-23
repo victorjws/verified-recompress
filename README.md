@@ -486,7 +486,7 @@ Other things worth knowing:
 ## Development
 
 ```sh
-cargo test          # 352 tests
+cargo test          # 353 tests
 cargo build --release
 ```
 

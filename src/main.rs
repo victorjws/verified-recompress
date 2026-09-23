@@ -245,10 +245,20 @@ async fn run_convert(cfg: &Config, args: &RunArgs) -> Result<()> {
     let governor = Arc::new(Governor::new(cfg, free)?);
 
     if let Some(dir) = &cfg.keep_originals {
-        tracing::info!(
-            "keeping originals under {} (outside the staging budget)",
-            dir.display()
-        );
+        if args.execute {
+            tracing::info!(
+                "keeping originals under {} (outside the staging budget)",
+                dir.display()
+            );
+        } else {
+            // Saying it unconditionally reads as a promise, and then the
+            // directory stays empty because a dry run replaces nothing.
+            tracing::info!(
+                "keep_originals is set to {}, but nothing is kept on a dry run: \
+                 originals are only preserved when one is about to be replaced.",
+                dir.display()
+            );
+        }
     }
 
     tracing::info!(
@@ -258,14 +268,29 @@ async fn run_convert(cfg: &Config, args: &RunArgs) -> Result<()> {
         cfg.cpu_cores,
     );
 
-    // Ctrl-C stops new work but lets in-flight jobs finish or roll back, so the
-    // remote is never left mid-replacement.
+    // Ctrl-C stops new work and lets in-flight jobs reach a point where nothing
+    // is half-replaced. A second one gives up on that and leaves immediately.
+    //
+    // The listener has to keep listening. Installing a handler takes SIGINT away
+    // from the kernel's default of killing the process, so a task that waits for
+    // one signal and then exits leaves the run unable to be interrupted at all.
     let cancel = CancellationToken::new();
     let signal = cancel.clone();
     tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_err() {
+            return;
+        }
+        tracing::warn!(
+            "interrupt received; finishing in-flight work then stopping. \
+             Interrupt again to stop now."
+        );
+        signal.cancel();
+
         if tokio::signal::ctrl_c().await.is_ok() {
-            tracing::warn!("interrupt received; finishing in-flight work then stopping");
-            signal.cancel();
+            // Nothing has been deleted that was not already replaced and
+            // confirmed, so leaving here costs the work in flight and no more.
+            tracing::warn!("second interrupt; stopping now");
+            std::process::exit(130);
         }
     });
 

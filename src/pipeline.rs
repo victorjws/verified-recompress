@@ -318,6 +318,10 @@ impl<R: Remote + 'static> Pipeline<R> {
         if reservation > self.governor.disk_capacity_mib() {
             return self.record_skip(&row.path, SkipReason::TooLargeForBudget).await;
         }
+        // The first thing a claimed file does is queue for staging space, and
+        // with a full budget it can sit here a long while before anything
+        // happens to it at all.
+        slot.stage(format!("waiting for {reservation} MiB of staging"));
         let _disk = self.governor.disk(reservation).await?;
 
         let job_id = self.next_job_id.fetch_add(1, Ordering::Relaxed);
@@ -392,6 +396,7 @@ impl<R: Remote + 'static> Pipeline<R> {
             let probe = probe
                 .as_ref()
                 .context("AV1 requires a probe, which should have been taken already")?;
+            slot.stage("waiting for cores");
             let cpu = self.governor.cpu(recipe).await;
             let duration = probe.duration_secs;
             // Only for the preset it was found at; a different one puts the
@@ -426,9 +431,10 @@ impl<R: Remote + 'static> Pipeline<R> {
         } else {
             slot.stage("fingerprinting");
             let fingerprint = convert::fingerprint(recipe, &input).await?;
-            slot.stage(format!("encoding ({})", recipe.as_str()));
+            slot.stage("waiting for cores");
             {
                 let cpu = self.governor.cpu(recipe).await;
+                slot.stage(format!("encoding ({})", recipe.as_str()));
                 convert::encode(
                     recipe,
                     &input,
@@ -448,8 +454,9 @@ impl<R: Remote + 'static> Pipeline<R> {
                 let _ = tokio::fs::remove_file(&input).await;
             }
 
-            slot.stage("verifying");
+            slot.stage("waiting for cores");
             let cpu = self.governor.cpu(recipe).await;
+            slot.stage("verifying");
             convert::verify(recipe, &output, &fingerprint, workspace.path(), cpu.cores()).await?
         };
 
@@ -504,7 +511,12 @@ impl<R: Remote + 'static> Pipeline<R> {
         };
 
         if !replaces_in_place {
+            // The API budget is small (four by default), so with many files in
+            // flight most of them queue here. Saying so is the difference
+            // between "waiting its turn" and "stuck".
+            slot.stage("waiting for an api slot");
             let _api = self.governor.api().await;
+            slot.stage("checking the destination");
             if self.remote.stat(&remote_output).await?.is_some() {
                 bail!("{remote_output} already exists; refusing to overwrite it");
             }
@@ -516,8 +528,20 @@ impl<R: Remote + 'static> Pipeline<R> {
         if let Some(floor) = opts.reclaim_when_low_mib {
             self.reclaim_if_low(floor, &slot).await;
         }
+        // This one can wait forever. Permits are held past the end of the job
+        // that took them, because a replaced original stays billed until the
+        // trash goes, so the budget only ever shrinks during a run. Once it is
+        // spent every remaining file waits here until something empties the
+        // trash — which is what `reclaim_when_low_gb` is for.
+        let available = self.governor.cloud_available_mib();
+        if available < cloud_mib {
+            slot.stage(format!(
+                "waiting for remote quota ({cloud_mib} MiB needed, {available} MiB left)"
+            ));
+        }
         let cloud = self.governor.cloud(cloud_mib).await?;
 
+        slot.stage("hashing the result");
         let local_hash = crate::hash::blake3_file(&output).await?;
         slot.stage("uploading");
         {
@@ -685,7 +709,7 @@ fn swap_extension(path: &str, new_extension: &str) -> String {
 /// finished with by this point, and a rename costs nothing. Across filesystems
 /// there is no choice but to copy.
 async fn keep_original(input: &Path, dir: &Path, remote_path: &str) -> Result<()> {
-    let target = dir.join(remote_path);
+    let target = dir.join(safe_relative(remote_path)?);
     if let Some(parent) = target.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -698,6 +722,31 @@ async fn keep_original(input: &Path, dir: &Path, remote_path: &str) -> Result<()
         .await
         .with_context(|| format!("failed to write {}", target.display()))?;
     Ok(())
+}
+
+/// Reduces a remote path to something that can only land under the directory it
+/// is joined to.
+///
+/// `Path::join` replaces the whole path when given an absolute one, so a single
+/// leading slash would write the original to the filesystem root instead — and
+/// silently, since the write itself would succeed. `..` would climb out the same
+/// way.
+fn safe_relative(remote_path: &str) -> Result<std::path::PathBuf> {
+    use std::path::Component;
+
+    let mut out = std::path::PathBuf::new();
+    for part in Path::new(remote_path).components() {
+        match part {
+            Component::Normal(name) => out.push(name),
+            // A leading slash or drive letter is dropped; the path stays relative.
+            Component::RootDir | Component::Prefix(_) | Component::CurDir => {}
+            Component::ParentDir => bail!("refusing to keep `{remote_path}` outside the directory"),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        bail!("`{remote_path}` has no file name to keep it under");
+    }
+    Ok(out)
 }
 
 /// The last path segment, which is what identifies a file at a glance. Full
@@ -775,6 +824,31 @@ async fn read_head(path: &std::path::Path) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Path::join` throws away everything before an absolute path, so a single
+    /// leading slash would put the original at the filesystem root instead of
+    /// under the chosen directory — and the write would succeed, so the only
+    /// symptom is a directory that never fills up.
+    #[test]
+    fn a_kept_original_cannot_escape_its_directory() {
+        assert_eq!(
+            safe_relative("Photos/2019/a.jpg").unwrap(),
+            std::path::Path::new("Photos/2019/a.jpg")
+        );
+        assert_eq!(
+            safe_relative("/Photos/a.jpg").unwrap(),
+            std::path::Path::new("Photos/a.jpg"),
+            "an absolute path is made relative, not honoured"
+        );
+        assert_eq!(
+            safe_relative("./a.jpg").unwrap(),
+            std::path::Path::new("a.jpg")
+        );
+
+        for bad in ["../a.jpg", "Photos/../../a.jpg", "/", ""] {
+            assert!(safe_relative(bad).is_err(), "{bad} should be refused");
+        }
+    }
 
     /// The remote path is kept so two originals with the same name do not
     /// overwrite each other, which is the whole point of preserving them.
