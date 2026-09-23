@@ -102,7 +102,7 @@ pub struct Governor {
     api: Arc<Semaphore>,
     cpu: Arc<Semaphore>,
     cpu_total: usize,
-    video_reserve_cores: usize,
+    non_video_cores: usize,
     free_cores: Arc<Mutex<Vec<usize>>>,
 }
 
@@ -135,10 +135,10 @@ impl Governor {
             cloud_capacity_mib: cloud_mib,
             net: Arc::new(Semaphore::new(cfg.net_concurrency)),
             api: Arc::new(Semaphore::new(cfg.api_concurrency)),
-            cpu: Arc::new(Semaphore::new(cfg.cpu_permits)),
-            cpu_total: cfg.cpu_permits,
-            video_reserve_cores: cfg.video_reserve_cores,
-            free_cores: Arc::new(Mutex::new((0..cfg.cpu_permits).collect())),
+            cpu: Arc::new(Semaphore::new(cfg.cpu_cores)),
+            cpu_total: cfg.cpu_cores,
+            non_video_cores: cfg.non_video_cores,
+            free_cores: Arc::new(Mutex::new((0..cfg.cpu_cores).collect())),
         })
     }
 
@@ -222,7 +222,7 @@ impl Governor {
 
     /// Grants cores for an encode.
     ///
-    /// Video asks for everything except `video_reserve_cores`, so image and audio
+    /// Video asks for everything except `non_video_cores`, so image and audio
     /// work keeps flowing through a long AV1 encode instead of the pipeline
     /// stalling on it. Everything else takes a single core.
     pub async fn cpu(&self, recipe: Recipe) -> CpuLease {
@@ -254,7 +254,7 @@ impl Governor {
         match recipe {
             Recipe::Av1 | Recipe::Ffv1 => self
                 .cpu_total
-                .saturating_sub(self.video_reserve_cores)
+                .saturating_sub(self.non_video_cores)
                 .max(1),
             _ => 1,
         }
@@ -273,8 +273,8 @@ mod tests {
             FileConfig {
                 staging_budget_gb: Some(budget_gb),
                 max_file_gb: Some(max_file_gb),
-                cpu_permits: Some(cpus),
-                video_reserve_cores: Some(2),
+                cpu_cores: Some(cpus),
+                non_video_cores: Some(2),
                 cloud_reserve_gb: Some(0),
                 ..Default::default()
             },

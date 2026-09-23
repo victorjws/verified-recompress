@@ -16,7 +16,7 @@ const DEFAULT_BUDGET_FRACTION: f64 = 0.70;
 const DEFAULT_CLOUD_RESERVE_GB: u64 = 5;
 const DEFAULT_NET_CONCURRENCY: usize = 8;
 const DEFAULT_API_CONCURRENCY: usize = 4;
-const DEFAULT_VIDEO_RESERVE_CORES: usize = 2;
+const DEFAULT_NON_VIDEO_CORES: usize = 2;
 const DEFAULT_PURGE_AFTER_DAYS: u32 = 30;
 const MIB: u64 = 1024 * 1024;
 
@@ -54,8 +54,14 @@ pub struct FileConfig {
     pub reclaim_when_low_gb: Option<u64>,
     pub net_concurrency: Option<usize>,
     pub api_concurrency: Option<usize>,
-    pub cpu_permits: Option<usize>,
-    pub video_reserve_cores: Option<usize>,
+    /// Read under its old name too: renaming a key must not stop an existing
+    /// config from loading, and `deny_unknown_fields` would reject it outright.
+    #[serde(alias = "cpu_permits")]
+    pub cpu_cores: Option<usize>,
+    /// Read under its old name too: renaming a key must not stop an existing
+    /// config from loading, and `deny_unknown_fields` would reject it outright.
+    #[serde(alias = "video_reserve_cores")]
+    pub non_video_cores: Option<usize>,
     pub order: Option<Order>,
     pub min_video_secs: Option<f64>,
     pub paths: Option<Vec<String>>,
@@ -92,8 +98,8 @@ pub struct Overrides {
     pub reclaim_when_low_gb: Option<u64>,
     pub net_concurrency: Option<usize>,
     pub api_concurrency: Option<usize>,
-    pub cpu_permits: Option<usize>,
-    pub video_reserve_cores: Option<usize>,
+    pub cpu_cores: Option<usize>,
+    pub non_video_cores: Option<usize>,
     pub order: Option<Order>,
     pub min_video_secs: Option<f64>,
     /// Replaces the file's `paths` entirely when non-empty.
@@ -115,8 +121,8 @@ pub struct Config {
     pub reclaim_when_low_mib: Option<u32>,
     pub net_concurrency: usize,
     pub api_concurrency: usize,
-    pub cpu_permits: usize,
-    pub video_reserve_cores: usize,
+    pub cpu_cores: usize,
+    pub non_video_cores: usize,
     pub order: Order,
     /// Duration floor for the AV1 tier, in seconds. Zero means no floor.
     pub min_video_secs: f64,
@@ -212,20 +218,20 @@ impl Config {
             Some(gb) => Some(gb_to_mib(gb, "reclaim_when_low_gb")?),
         };
 
-        let cpu_permits = match ov.cpu_permits.or(file.cpu_permits) {
+        let cpu_cores = match ov.cpu_cores.or(file.cpu_cores) {
             None | Some(0) => num_cpus::get(),
             Some(n) => n,
         };
 
-        let video_reserve_cores = ov
-            .video_reserve_cores
-            .or(file.video_reserve_cores)
-            .unwrap_or(DEFAULT_VIDEO_RESERVE_CORES);
+        let non_video_cores = ov
+            .non_video_cores
+            .or(file.non_video_cores)
+            .unwrap_or(DEFAULT_NON_VIDEO_CORES);
 
-        if video_reserve_cores >= cpu_permits {
+        if non_video_cores >= cpu_cores {
             bail!(
-                "video_reserve_cores ({video_reserve_cores}) must be less than cpu_permits \
-                 ({cpu_permits}); otherwise video encoding gets no cores"
+                "non_video_cores ({non_video_cores}) must be less than cpu_cores \
+                 ({cpu_cores}); otherwise video encoding gets no cores"
             );
         }
 
@@ -266,8 +272,8 @@ impl Config {
             reclaim_when_low_mib,
             net_concurrency,
             api_concurrency,
-            cpu_permits,
-            video_reserve_cores,
+            cpu_cores,
+            non_video_cores,
             order: ov.order.or(file.order).unwrap_or(Order::Savings),
             min_video_secs,
             paths,
@@ -400,25 +406,38 @@ mod tests {
         assert_eq!(cfg.reclaim_when_low_mib, None);
     }
 
+    /// Both settings were renamed to say which side of the split they name.
+    /// `deny_unknown_fields` turns a stale key into a hard load failure, so the
+    /// old spellings have to keep working.
     #[test]
-    fn cpu_permits_zero_means_detect() {
+    fn the_previous_key_names_still_load() {
+        let file: FileConfig = toml::from_str(
+            "cpu_permits = 8\nvideo_reserve_cores = 3\n",
+        )
+        .unwrap();
+        assert_eq!(file.cpu_cores, Some(8));
+        assert_eq!(file.non_video_cores, Some(3));
+    }
+
+    #[test]
+    fn cpu_cores_zero_means_detect() {
         let file = FileConfig {
-            cpu_permits: Some(0),
+            cpu_cores: Some(0),
             ..Default::default()
         };
         let cfg = resolve(file, Overrides::default(), 100 * GB).unwrap();
-        assert_eq!(cfg.cpu_permits, num_cpus::get());
+        assert_eq!(cfg.cpu_cores, num_cpus::get());
     }
 
     #[test]
     fn video_reserve_must_leave_cores_for_video() {
         let file = FileConfig {
-            cpu_permits: Some(2),
-            video_reserve_cores: Some(2),
+            cpu_cores: Some(2),
+            non_video_cores: Some(2),
             ..Default::default()
         };
         let err = resolve(file, Overrides::default(), 100 * GB).unwrap_err();
-        assert!(err.to_string().contains("must be less than cpu_permits"), "{err}");
+        assert!(err.to_string().contains("must be less than cpu_cores"), "{err}");
     }
 
     #[test]
@@ -481,8 +500,8 @@ cloud_reserve_gb = 5
 reclaim_when_low_gb = 0
 net_concurrency = 8
 api_concurrency = 4
-cpu_permits = 0
-video_reserve_cores = 2
+cpu_cores = 0
+non_video_cores = 2
 order = "savings"
 paths = ["/Photos/2019", "/Camera"]
 exclude = ["**/.thumbnails/**"]

@@ -135,17 +135,17 @@ pub struct RunArgs {
     #[arg(long, value_name = "N")]
     pub net_concurrency: Option<usize>,
 
-    /// Total CPU permits. 0 detects the core count.
-    #[arg(long, value_name = "N")]
-    pub cpu_permits: Option<usize>,
+    /// Cores the run may use in total. 0 detects the machine's core count.
+    #[arg(long, value_name = "N", alias = "cpu-permits")]
+    pub cpu_cores: Option<usize>,
 
     /// Concurrent lightweight remote API calls.
     #[arg(long, value_name = "N")]
     pub api_concurrency: Option<usize>,
 
-    /// Cores video encoding leaves free so image jobs keep flowing.
-    #[arg(long, value_name = "N")]
-    pub video_reserve_cores: Option<usize>,
+    /// Cores video encoding may not take, so image and audio jobs keep flowing.
+    #[arg(long, value_name = "N", alias = "video-reserve-cores")]
+    pub non_video_cores: Option<usize>,
 
     /// Order files are picked up in.
     #[arg(long, value_enum)]
@@ -190,8 +190,8 @@ impl Cli {
             ov.reclaim_when_low_gb = args.reclaim_when_low_gb;
             ov.net_concurrency = args.net_concurrency;
             ov.api_concurrency = args.api_concurrency;
-            ov.cpu_permits = args.cpu_permits;
-            ov.video_reserve_cores = args.video_reserve_cores;
+            ov.cpu_cores = args.cpu_cores;
+            ov.non_video_cores = args.non_video_cores;
             ov.order = args.order;
             ov.min_video_secs = args.min_video_secs;
             ov.trash_policy = args.trash_policy;

@@ -222,7 +222,11 @@ pub async fn verify(
 pub fn command(program: &str, cores: &[usize]) -> Command {
     if cores.is_empty() || !taskset_available() {
         let mut cmd = Command::new(program);
-        cmd.stdin(Stdio::null());
+        // An encode dropped mid-flight — a cancelled run, an error unwinding —
+        // would otherwise leave ffmpeg running against a staging directory
+        // nobody owns any more, still burning the cores it was granted. This
+        // cannot help against SIGKILL, where nothing of ours runs at all.
+        cmd.stdin(Stdio::null()).kill_on_drop(true);
         return cmd;
     }
     let list = cores
@@ -231,7 +235,11 @@ pub fn command(program: &str, cores: &[usize]) -> Command {
         .collect::<Vec<_>>()
         .join(",");
     let mut cmd = Command::new("taskset");
-    cmd.arg("-c").arg(list).arg(program).stdin(Stdio::null());
+    cmd.arg("-c")
+        .arg(list)
+        .arg(program)
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
     cmd
 }
 

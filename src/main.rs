@@ -244,10 +244,10 @@ async fn run_convert(cfg: &Config, args: &RunArgs) -> Result<()> {
     let governor = Arc::new(Governor::new(cfg, free)?);
 
     tracing::info!(
-        "budgets: {} local staging, {} remote headroom, {} cpu permit(s)",
+        "budgets: {} local staging, {} remote headroom, {} cpu core(s)",
         format_size(u64::from(governor.disk_capacity_mib()) * 1024 * 1024, DECIMAL),
         format_size(u64::from(governor.cloud_capacity_mib()) * 1024 * 1024, DECIMAL),
-        cfg.cpu_permits,
+        cfg.cpu_cores,
     );
 
     // Ctrl-C stops new work but lets in-flight jobs finish or roll back, so the

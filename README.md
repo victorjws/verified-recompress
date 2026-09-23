@@ -258,9 +258,9 @@ nothing to the remote.
 | `--cloud-reserve-gb GB` | keep this much remote quota free as a margin (default 5) |
 | `--reclaim-when-low-gb GB` | auto-purge trash below this much free remote space. `0` disables |
 | `--net-concurrency N` | concurrent uploads and downloads (default 8) |
-| `--cpu-permits N` | total CPU permits. `0` detects the core count |
+| `--cpu-cores N` | cores the run may use in total. `0` detects the machine's core count |
 | `--api-concurrency N` | concurrent lightweight remote API calls (default 4) |
-| `--video-reserve-cores N` | cores video encoding leaves free so image jobs keep flowing (default 2) |
+| `--non-video-cores N` | cores video encoding may not take, so image and audio jobs keep flowing (default 2) |
 | `--order savings\|size\|path` | order files are picked up in (default `savings`) |
 | `--min-video-secs SECONDS` | leave videos shorter than this alone (default `0`, meaning convert every length) |
 | `--preset N` | SVT-AV1 preset. Lower is smaller and slower |
@@ -329,8 +329,8 @@ cloud_reserve_gb = 5
 reclaim_when_low_gb = 0
 net_concurrency = 8
 api_concurrency = 4
-cpu_permits = 0
-video_reserve_cores = 2
+cpu_cores = 0
+non_video_cores = 2
 order = "savings"
 min_video_secs = 0
 paths = ["/Photos/2019", "/Camera"]
@@ -349,8 +349,8 @@ purge_after_days = 30
 | `reclaim_when_low_gb` | disabled | `0` means disabled |
 | `net_concurrency` | 8 | must be at least 1 |
 | `api_concurrency` | 4 | must be at least 1 |
-| `cpu_permits` | detected core count | `0` means detect |
-| `video_reserve_cores` | 2 | must be less than `cpu_permits` |
+| `cpu_cores` | detected core count | `0` means detect. Was `cpu_permits`, which still loads |
+| `non_video_cores` | 2 | cores video may **not** take. Must be less than `cpu_cores`. Was `video_reserve_cores`, which read as the opposite and still loads |
 | `order` | `savings` | `savings`, `size`, or `path`. `savings` ranks by projected saving, so a small file with a good ratio outranks a large one that converts poorly |
 | `min_video_secs` | `0` | duration floor for the AV1 tier. `0` converts every length |
 | `paths` | whole remote | CLI `--path` replaces this list entirely |
@@ -428,7 +428,7 @@ Other things worth knowing:
 ## Development
 
 ```sh
-cargo test          # 325 tests
+cargo test          # 326 tests
 cargo build --release
 ```
 
