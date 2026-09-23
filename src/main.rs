@@ -252,6 +252,13 @@ async fn run_convert(cfg: &Config, args: &RunArgs) -> Result<()> {
         .context("the remote did not report free space, so uploads cannot be budgeted")?;
     let governor = Arc::new(Governor::new(cfg, free)?);
 
+    if let Some(dir) = &cfg.keep_originals {
+        tracing::info!(
+            "keeping originals under {} (outside the staging budget)",
+            dir.display()
+        );
+    }
+
     tracing::info!(
         "budgets: {} local staging, {} remote headroom, {} cpu core(s)",
         format_size(u64::from(governor.disk_capacity_mib()) * 1024 * 1024, DECIMAL),
@@ -291,6 +298,9 @@ async fn run_convert(cfg: &Config, args: &RunArgs) -> Result<()> {
             limit: args.limit,
             scope: Scope::new(&cfg.paths, &cfg.exclude)?,
             order: cfg.order,
+            // Only on a real run: a dry run leaves the remote original where it
+            // is, so there is nothing to preserve it from.
+            keep_originals: args.execute.then(|| cfg.keep_originals.clone()).flatten(),
             min_video_secs: cfg.min_video_secs,
             video: convert::VideoOptions {
                 preset: args.preset,

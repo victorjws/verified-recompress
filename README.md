@@ -253,6 +253,7 @@ nothing to the remote.
 | `--allow-video` | permit the irreversible AV1 tier |
 | `--limit N` | stop after N files |
 | `--staging-dir DIR` | local scratch directory |
+| `--keep-originals DIR` | leave a copy of each original here before its replacement takes over |
 | `--budget-gb GB` | local staging budget (default: 70% of free space) |
 | `--max-file-gb GB` | skip files whose staging reservation exceeds this (default: half the budget) |
 | `--cloud-reserve-gb GB` | keep this much remote quota free as a margin (default 5) |
@@ -270,6 +271,23 @@ nothing to the remote.
 
 Work is scheduled per file with separate semaphores for disk, network, CPU and API calls, so a job
 waiting for a core does not hold a network slot.
+
+#### Keeping the originals
+
+`--keep-originals DIR` writes each original under `DIR` before its replacement takes
+over, mirroring the remote path so two files of the same name do not collide. It is
+the local counterpart to the trash: the remote copy is recoverable until `cleanup`
+purges it, and this one is not on a clock.
+
+The copy is taken after the conversion has proven itself and before anything on the
+remote changes, so a failure to write it stops the run with the original still in
+place. A dry run keeps nothing, because it replaces nothing.
+
+`DIR` is **not** counted against the staging budget — you chose where it goes, and
+it holds files past the end of the run that put them there. The budget does account
+for the original staying on disk longer than it otherwise would: recipes that
+normally drop their source before verification reserve one extra copy while this is
+on.
 
 #### Resuming after an interruption
 
@@ -358,6 +376,7 @@ purge_after_days = 30
 | --- | --- | --- |
 | `remote` | `filen:` | any rclone remote |
 | `staging_dir` | `$TMPDIR/verified-recompress` | see below |
+| `keep_originals` | disabled | where to leave each original. Not counted against the staging budget |
 | `staging_budget_gb` | 70% of free space | rejected if larger than what is actually free |
 | `max_file_gb` | half the budget | files needing more are skipped as `too_large_for_budget` |
 | `cloud_reserve_gb` | 5 | remote headroom kept free |
@@ -384,6 +403,7 @@ survive a reboot:
 
 ```toml
 staging_dir = "/var/lib/verified-recompress"
+# keep_originals = "/mnt/archive/originals"
 ```
 
 Local staging directories left behind by an interrupted run are swept at the start of the next
@@ -443,7 +463,7 @@ Other things worth knowing:
 ## Development
 
 ```sh
-cargo test          # 340 tests
+cargo test          # 342 tests
 cargo build --release
 ```
 

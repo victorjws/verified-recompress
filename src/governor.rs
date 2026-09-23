@@ -29,8 +29,8 @@ pub fn bytes_to_mib(bytes: u64) -> u32 {
 ///
 /// The source is deleted right after encoding wherever verification can work from
 /// a recorded digest, which is what keeps most of these under 2x.
-pub fn peak_reservation_ratio(recipe: Recipe) -> f64 {
-    match recipe {
+pub fn peak_reservation_ratio(recipe: Recipe, keep_source: bool) -> f64 {
+    let base = match recipe {
         // input + output, then input dropped and the djxl rebuild written.
         Recipe::JxlFromJpeg | Recipe::JxlFromRaster | Recipe::JxlFromWebp => 1.8,
         Recipe::Flac | Recipe::FlacRecompress => 1.5,
@@ -39,11 +39,26 @@ pub fn peak_reservation_ratio(recipe: Recipe) -> f64 {
         Recipe::Ffv1 => 2.5,
         // VMAF decodes source and result together, so the source cannot be dropped.
         Recipe::Av1 => 1.65,
+    };
+    // The figures above assume the source is dropped as soon as it is no longer
+    // needed. Keeping it for `--keep-originals` means it is still on disk while
+    // the output and any verification rebuild exist, which is one more copy than
+    // they account for. The video recipes already hold it, so they are already
+    // counted.
+    if keep_source && !holds_source(recipe) {
+        base + 1.0
+    } else {
+        base
     }
 }
 
-pub fn reservation_mib(recipe: Recipe, input_bytes: u64) -> u32 {
-    bytes_to_mib((input_bytes as f64 * peak_reservation_ratio(recipe)).ceil() as u64)
+/// Whether a recipe needs its source present through verification.
+pub fn holds_source(recipe: Recipe) -> bool {
+    matches!(recipe, Recipe::Av1 | Recipe::Ffv1)
+}
+
+pub fn reservation_mib(recipe: Recipe, input_bytes: u64, keep_source: bool) -> u32 {
+    bytes_to_mib((input_bytes as f64 * peak_reservation_ratio(recipe, keep_source)).ceil() as u64)
 }
 
 /// A held slice of a budget. Dropping it returns the capacity.
@@ -304,16 +319,16 @@ mod tests {
         let eight_gib = 8 * GB;
         assert!(u32::try_from(eight_gib).is_err());
         assert_eq!(bytes_to_mib(eight_gib), 8192);
-        assert_eq!(reservation_mib(Recipe::JxlFromJpeg, eight_gib), 14746);
+        assert_eq!(reservation_mib(Recipe::JxlFromJpeg, eight_gib, false), 14746);
     }
 
     #[test]
     fn reservations_follow_the_recipe() {
         let one_gib = GB;
-        assert_eq!(reservation_mib(Recipe::JxlFromJpeg, one_gib), 1844);
-        assert_eq!(reservation_mib(Recipe::Flac, one_gib), 1536);
-        assert_eq!(reservation_mib(Recipe::Ffv1, one_gib), 2560);
-        assert_eq!(reservation_mib(Recipe::Av1, one_gib), 1690);
+        assert_eq!(reservation_mib(Recipe::JxlFromJpeg, one_gib, false), 1844);
+        assert_eq!(reservation_mib(Recipe::Flac, one_gib, false), 1536);
+        assert_eq!(reservation_mib(Recipe::Ffv1, one_gib, false), 2560);
+        assert_eq!(reservation_mib(Recipe::Av1, one_gib, false), 1690);
     }
 
     #[tokio::test]
@@ -441,6 +456,29 @@ mod tests {
     async fn video_always_gets_at_least_one_core() {
         let g = governor(50, 10, 3, 100);
         assert_eq!(g.cpu(Recipe::Av1).await.cores().len(), 1);
+    }
+
+    /// Keeping the original means it is still on disk while the output and any
+    /// verification rebuild exist. A reservation that assumed it had been
+    /// dropped would let the staging budget be overrun by exactly one copy of
+    /// every file in flight.
+    #[test]
+    fn keeping_the_original_reserves_room_for_it() {
+        let gib = 1024 * MIB;
+        assert_eq!(reservation_mib(Recipe::JxlFromJpeg, gib, false), 1844);
+        assert_eq!(reservation_mib(Recipe::JxlFromJpeg, gib, true), 2868);
+
+        // The video recipes already hold their source through verification, so
+        // they must not be charged for it twice.
+        for recipe in [Recipe::Av1, Recipe::Ffv1] {
+            assert_eq!(
+                reservation_mib(recipe, gib, true),
+                reservation_mib(recipe, gib, false),
+                "{recipe:?} already holds its source"
+            );
+            assert!(holds_source(recipe));
+        }
+        assert!(!holds_source(Recipe::JxlFromJpeg));
     }
 
     #[tokio::test]

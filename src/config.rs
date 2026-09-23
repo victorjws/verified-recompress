@@ -48,6 +48,7 @@ pub enum Order {
 pub struct FileConfig {
     pub remote: Option<String>,
     pub staging_dir: Option<PathBuf>,
+    pub keep_originals: Option<PathBuf>,
     pub staging_budget_gb: Option<u64>,
     pub max_file_gb: Option<u64>,
     pub cloud_reserve_gb: Option<u64>,
@@ -92,6 +93,7 @@ impl FileConfig {
 pub struct Overrides {
     pub remote: Option<String>,
     pub staging_dir: Option<PathBuf>,
+    pub keep_originals: Option<PathBuf>,
     pub staging_budget_gb: Option<u64>,
     pub max_file_gb: Option<u64>,
     pub cloud_reserve_gb: Option<u64>,
@@ -115,6 +117,10 @@ pub struct Overrides {
 pub struct Config {
     pub remote: String,
     pub staging_dir: PathBuf,
+    /// Where to leave a copy of each original before its replacement takes over.
+    /// Outside the staging budget: the caller chose the location, and it holds
+    /// files past the end of the run that put them there.
+    pub keep_originals: Option<PathBuf>,
     pub staging_budget_mib: u32,
     pub max_file_mib: u32,
     pub cloud_reserve_mib: u32,
@@ -266,6 +272,7 @@ impl Config {
                 .or(file.remote)
                 .unwrap_or_else(|| "filen:".to_string()),
             staging_dir,
+            keep_originals: ov.keep_originals.or(file.keep_originals),
             staging_budget_mib,
             max_file_mib,
             cloud_reserve_mib,

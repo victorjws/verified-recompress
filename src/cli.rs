@@ -115,6 +115,11 @@ pub struct RunArgs {
     #[arg(long, value_name = "DIR")]
     pub staging_dir: Option<PathBuf>,
 
+    /// Keep a copy of each original here before its replacement takes over.
+    /// Not counted against the staging budget.
+    #[arg(long, value_name = "DIR")]
+    pub keep_originals: Option<PathBuf>,
+
     /// Local staging budget in GB.
     #[arg(long, value_name = "GB")]
     pub budget_gb: Option<u64>,
@@ -184,6 +189,7 @@ impl Cli {
 
         if let Command::Run(args) = &self.command {
             ov.staging_dir = args.staging_dir.clone();
+            ov.keep_originals = args.keep_originals.clone();
             ov.staging_budget_gb = args.budget_gb;
             ov.max_file_gb = args.max_file_gb;
             ov.cloud_reserve_gb = args.cloud_reserve_gb;

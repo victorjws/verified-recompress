@@ -10,6 +10,7 @@
 //! count: a lease is taken before the download and held until the job ends, so the
 //! disk can never be oversubscribed.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -78,6 +79,8 @@ pub struct Options {
     pub scope: Scope,
     /// Sequence files are claimed in.
     pub order: Order,
+    /// Where to leave a copy of each original before its replacement takes over.
+    pub keep_originals: Option<std::path::PathBuf>,
     /// Duration floor for the AV1 tier, in seconds. Zero converts every length.
     pub min_video_secs: f64,
     /// Encoder settings the video recipes need.
@@ -260,7 +263,8 @@ impl<R: Remote + 'static> Pipeline<R> {
         // Reserve the worst case for any recipe this file might take, so the disk
         // cannot be oversubscribed by a decision that changes after the download.
         let provisional = cheap.recipe().unwrap_or(Recipe::Av1);
-        let reservation = governor::reservation_mib(provisional, row.size);
+        let reservation =
+            governor::reservation_mib(provisional, row.size, opts.keep_originals.is_some());
         if reservation > self.governor.disk_capacity_mib() {
             return self.record_skip(&row.path, SkipReason::TooLargeForBudget).await;
         }
@@ -388,7 +392,9 @@ impl<R: Remote + 'static> Pipeline<R> {
 
             // Verification works from the recorded fingerprint, so the source can
             // go now and the peak footprint stays near one copy plus the output.
-            if !keeps_source_for_verification(recipe) {
+            // Kept when the run was asked to preserve originals: the copy is
+            // taken below, once the conversion has proven itself.
+            if !keeps_source_for_verification(recipe) && opts.keep_originals.is_none() {
                 let _ = tokio::fs::remove_file(&input).await;
             }
 
@@ -420,6 +426,16 @@ impl<R: Remote + 'static> Pipeline<R> {
                 input: row.size,
                 output: output_bytes,
             });
+        }
+
+        // Before anything on the remote changes. A failure to keep the original
+        // must not leave a run that has already replaced it, which is the one
+        // outcome this option exists to prevent.
+        if let Some(dir) = &opts.keep_originals {
+            slot.stage("keeping the original");
+            keep_original(&input, dir, &row.path)
+                .await
+                .with_context(|| format!("could not keep a copy of {}", row.path))?;
         }
 
         let remote_output =
@@ -609,6 +625,28 @@ fn swap_extension(path: &str, new_extension: &str) -> String {
 }
 
 /// Reads the first few KiB, for confirming extensions that lie.
+/// Puts the original under `dir`, keeping its remote path so two files with the
+/// same name do not collide.
+///
+/// Moved rather than copied where the filesystem allows it: the staging copy is
+/// finished with by this point, and a rename costs nothing. Across filesystems
+/// there is no choice but to copy.
+async fn keep_original(input: &Path, dir: &Path, remote_path: &str) -> Result<()> {
+    let target = dir.join(remote_path);
+    if let Some(parent) = target.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    if tokio::fs::rename(input, &target).await.is_ok() {
+        return Ok(());
+    }
+    tokio::fs::copy(input, &target)
+        .await
+        .with_context(|| format!("failed to write {}", target.display()))?;
+    Ok(())
+}
+
 /// The last path segment, which is what identifies a file at a glance. Full
 /// paths are long enough to push everything else off the line.
 fn short_name(path: &str) -> String {
@@ -684,6 +722,36 @@ async fn read_head(path: &std::path::Path) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The remote path is kept so two originals with the same name do not
+    /// overwrite each other, which is the whole point of preserving them.
+    #[tokio::test]
+    async fn keeping_an_original_mirrors_the_remote_path() {
+        let work = tempfile::tempdir().unwrap();
+        let keep = tempfile::tempdir().unwrap();
+        let input = work.path().join("input.jpg");
+        std::fs::write(&input, b"original bytes").unwrap();
+
+        keep_original(&input, keep.path(), "Photos/2019/summer/IMG_0421.jpg")
+            .await
+            .unwrap();
+
+        let kept = keep.path().join("Photos/2019/summer/IMG_0421.jpg");
+        assert_eq!(std::fs::read(&kept).unwrap(), b"original bytes");
+
+        // A second file of the same name from a different folder must survive
+        // alongside the first.
+        let other = work.path().join("other.jpg");
+        std::fs::write(&other, b"different bytes").unwrap();
+        keep_original(&other, keep.path(), "Photos/2020/IMG_0421.jpg")
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&kept).unwrap(), b"original bytes");
+        assert_eq!(
+            std::fs::read(keep.path().join("Photos/2020/IMG_0421.jpg")).unwrap(),
+            b"different bytes"
+        );
+    }
 
     #[test]
     fn a_line_is_labelled_by_the_file_not_the_path() {
