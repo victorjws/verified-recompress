@@ -81,6 +81,8 @@ pub struct Options {
     pub order: Order,
     /// Where to leave a copy of each original before its replacement takes over.
     pub keep_originals: Option<std::path::PathBuf>,
+    /// Empty the trash mid-run once remote free space falls below this many MiB.
+    pub reclaim_when_low_mib: Option<u32>,
     /// Duration floor for the AV1 tier, in seconds. Zero converts every length.
     pub min_video_secs: f64,
     /// Encoder settings the video recipes need.
@@ -98,6 +100,9 @@ pub struct Pipeline<R: Remote + 'static> {
     /// Downloads a previous run already fetched, by remote path. Each is used at
     /// most once; taking it out is what stops two jobs adopting the same one.
     salvaged: std::sync::Mutex<std::collections::HashMap<String, std::path::PathBuf>>,
+    /// Serialises mid-run trash emptying. Every job in flight notices the
+    /// shortage at about the same moment, and one purge answers all of them.
+    reclaiming: tokio::sync::Mutex<()>,
     next_job_id: AtomicU64,
 }
 
@@ -120,6 +125,7 @@ impl<R: Remote + 'static> Pipeline<R> {
             max_file_bytes,
             cancel,
             salvaged: std::sync::Mutex::new(salvaged),
+            reclaiming: tokio::sync::Mutex::new(()),
             next_job_id: AtomicU64::new(0),
         }
     }
@@ -182,6 +188,50 @@ impl<R: Remote + 'static> Pipeline<R> {
         }
         self.board.finish();
         Ok(summary)
+    }
+
+    /// Empties the trash when the remote budget has run down past `floor`.
+    ///
+    /// Replaced originals stay billed until the trash goes, so a long run spends
+    /// quota it has already earned back. Emptying it mid-run returns that space
+    /// and lets the run continue instead of stalling on a budget that is only
+    /// notionally full.
+    ///
+    /// Irreversible, which is why it is opt-in and why the run must also be
+    /// keeping originals locally: this is the point past which a replaced file
+    /// cannot be recovered from the remote at all.
+    async fn reclaim_if_low(&self, floor: u32, slot: &crate::progress::Slot) {
+        if self.governor.cloud_available_mib() >= floor {
+            return;
+        }
+        // One purge answers every job that noticed the shortage together.
+        let _one_at_a_time = self.reclaiming.lock().await;
+        if self.governor.cloud_available_mib() >= floor {
+            return;
+        }
+
+        slot.stage("emptying the trash");
+        tracing::info!(
+            "remote budget down to {} MiB; emptying the trash",
+            self.governor.cloud_available_mib()
+        );
+        if let Err(e) = self.remote.cleanup().await {
+            // Not fatal: the run carries on and blocks on the budget instead,
+            // which is the behaviour it would have had anyway.
+            tracing::warn!("could not empty the trash: {e:#}");
+            return;
+        }
+        match self.ledger.mark_reclaimed().await {
+            Ok(bytes) => {
+                let mib = governor::bytes_to_mib(bytes);
+                self.governor.release_cloud(mib);
+                tracing::info!(
+                    "reclaimed {}; remote budget returned",
+                    humansize::format_size(bytes, humansize::DECIMAL)
+                );
+            }
+            Err(e) => tracing::warn!("trash emptied but the ledger did not record it: {e:#}"),
+        }
     }
 
     /// Takes a salvaged download for `path`, if one is there and still current.
@@ -463,6 +513,9 @@ impl<R: Remote + 'static> Pipeline<R> {
         // Hold remote quota for the upload. It is only released once the trash has
         // actually been emptied, because until then the original is still billed.
         let cloud_mib = governor::bytes_to_mib(output_bytes);
+        if let Some(floor) = opts.reclaim_when_low_mib {
+            self.reclaim_if_low(floor, &slot).await;
+        }
         let cloud = self.governor.cloud(cloud_mib).await?;
 
         let local_hash = crate::hash::blake3_file(&output).await?;

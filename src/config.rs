@@ -219,10 +219,24 @@ impl Config {
         )?;
 
         // 0 is the documented "disabled" sentinel for automatic reclamation.
+        let keep_originals = ov.keep_originals.or(file.keep_originals);
         let reclaim_when_low_mib = match ov.reclaim_when_low_gb.or(file.reclaim_when_low_gb) {
             None | Some(0) => None,
             Some(gb) => Some(gb_to_mib(gb, "reclaim_when_low_gb")?),
         };
+
+        // Emptying the trash mid-run is the point past which a replaced file
+        // cannot be recovered from the remote at all, not even from the web app.
+        // Requiring a local copy keeps one way back.
+        if reclaim_when_low_mib.is_some() && keep_originals.is_none() {
+            bail!(
+                "reclaim_when_low_gb empties the trash during a run, which is the \
+                 point past which a replaced original cannot be recovered from the \
+                 remote at all. Set keep_originals so there is still a local copy, \
+                 or leave reclaim_when_low_gb unset and run `cleanup --execute` \
+                 yourself when the run is done."
+            );
+        }
 
         let cpu_cores = match ov.cpu_cores.or(file.cpu_cores) {
             None | Some(0) => num_cpus::get(),
@@ -272,7 +286,7 @@ impl Config {
                 .or(file.remote)
                 .unwrap_or_else(|| "filen:".to_string()),
             staging_dir,
-            keep_originals: ov.keep_originals.or(file.keep_originals),
+            keep_originals,
             staging_budget_mib,
             max_file_mib,
             cloud_reserve_mib,
@@ -325,6 +339,61 @@ mod tests {
 
     fn resolve(file: FileConfig, ov: Overrides, avail: u64) -> Result<Config> {
         Config::resolve(file, ov, avail)
+    }
+
+    /// Emptying the trash mid-run destroys the remote way back — not even the
+    /// Filen web app can recover a purged file. Without a local copy there
+    /// would be no way back at all, which is not a trade a config file should be
+    /// able to make by accident.
+    #[test]
+    fn mid_run_reclaim_needs_somewhere_to_keep_the_originals() {
+        let ov = Overrides {
+            reclaim_when_low_gb: Some(50),
+            ..Default::default()
+        };
+        let err = resolve(FileConfig::default(), ov, 100 * GB).unwrap_err();
+        assert!(err.to_string().contains("keep_originals"), "{err}");
+
+        let ov = Overrides {
+            reclaim_when_low_gb: Some(50),
+            keep_originals: Some("/mnt/archive".into()),
+            ..Default::default()
+        };
+        let cfg = resolve(FileConfig::default(), ov, 100 * GB).unwrap();
+        assert_eq!(cfg.reclaim_when_low_mib, Some(50 * 1024));
+    }
+
+    /// Zero is the documented way to leave it off, and off must not drag the
+    /// requirement along with it.
+    #[test]
+    fn a_zero_reclaim_threshold_demands_nothing() {
+        let ov = Overrides {
+            reclaim_when_low_gb: Some(0),
+            ..Default::default()
+        };
+        let cfg = resolve(FileConfig::default(), ov, 100 * GB).unwrap();
+        assert_eq!(cfg.reclaim_when_low_mib, None);
+        assert_eq!(cfg.keep_originals, None);
+    }
+
+    #[test]
+    fn min_video_secs_defaults_to_no_floor() {
+        let cfg = resolve(FileConfig::default(), Overrides::default(), 100 * GB).unwrap();
+        assert_eq!(cfg.min_video_secs, 0.0);
+    }
+
+    #[test]
+    fn a_negative_or_nonsense_video_floor_is_rejected() {
+        for bad in [-1.0, f64::NAN, f64::INFINITY] {
+            let ov = Overrides {
+                min_video_secs: Some(bad),
+                ..Default::default()
+            };
+            assert!(
+                resolve(FileConfig::default(), ov, 100 * GB).is_err(),
+                "{bad} should be rejected"
+            );
+        }
     }
 
     #[test]

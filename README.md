@@ -254,6 +254,7 @@ nothing to the remote.
 | `--limit N` | stop after N files |
 | `--staging-dir DIR` | local scratch directory |
 | `--keep-originals DIR` | leave a copy of each original here before its replacement takes over |
+| `--reclaim-when-low-gb GB` | empty the trash mid-run once remote free space falls below this. Requires `--keep-originals` |
 | `--budget-gb GB` | local staging budget (default: 70% of free space) |
 | `--max-file-gb GB` | skip files whose staging reservation exceeds this (default: half the budget) |
 | `--cloud-reserve-gb GB` | keep this much remote quota free as a margin (default 5) |
@@ -288,6 +289,27 @@ it holds files past the end of the run that put them there. The budget does acco
 for the original staying on disk longer than it otherwise would: recipes that
 normally drop their source before verification reserve one extra copy while this is
 on.
+
+#### When the remote is nearly full
+
+A replaced original stays billed until the trash is emptied, so a long run spends
+quota it has already earned back and eventually stalls on a budget that is only
+notionally full. `--reclaim-when-low-gb GB` empties the trash mid-run when free
+space falls below that figure and returns the space to the run's budget:
+
+```
+INFO remote budget down to 41216 MiB; emptying the trash
+INFO reclaimed 180.4 GB; remote budget returned
+```
+
+rclone can only empty the whole trash, not one file, so this is batched rather than
+done per file — one purge answers every job that noticed the shortage.
+
+It is irreversible, and it is the point past which a replaced original cannot be
+recovered from the remote **at all**, not even from the Filen web app. So it
+requires `--keep-originals`: there has to be a way back, and once the remote one is
+gone the local copy is it. Leave the threshold unset to empty the trash yourself
+with `cleanup --execute` after the run.
 
 #### Resuming after an interruption
 
@@ -380,7 +402,7 @@ purge_after_days = 30
 | `staging_budget_gb` | 70% of free space | rejected if larger than what is actually free |
 | `max_file_gb` | half the budget | files needing more are skipped as `too_large_for_budget` |
 | `cloud_reserve_gb` | 5 | remote headroom kept free |
-| `reclaim_when_low_gb` | disabled | `0` means disabled |
+| `reclaim_when_low_gb` | disabled | `0` means disabled. Requires `keep_originals` |
 | `net_concurrency` | 8 | must be at least 1 |
 | `api_concurrency` | 4 | must be at least 1 |
 | `cpu_cores` | detected core count | `0` means detect. Was `cpu_permits`, which still loads |
@@ -463,7 +485,7 @@ Other things worth knowing:
 ## Development
 
 ```sh
-cargo test          # 342 tests
+cargo test          # 346 tests
 cargo build --release
 ```
 

@@ -301,6 +301,8 @@ async fn run_convert(cfg: &Config, args: &RunArgs) -> Result<()> {
             // Only on a real run: a dry run leaves the remote original where it
             // is, so there is nothing to preserve it from.
             keep_originals: args.execute.then(|| cfg.keep_originals.clone()).flatten(),
+            // Dry runs replace nothing, so there is nothing billed to reclaim.
+            reclaim_when_low_mib: args.execute.then_some(cfg.reclaim_when_low_mib).flatten(),
             min_video_secs: cfg.min_video_secs,
             video: convert::VideoOptions {
                 preset: args.preset,
