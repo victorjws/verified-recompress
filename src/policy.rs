@@ -113,8 +113,14 @@ impl Recipe {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
-    /// Already in an efficient format; re-encoding would only add loss.
+    /// Already in an efficient format; re-encoding would only add loss. Decided
+    /// from the path alone — nothing was fetched or encoded.
     AlreadyOptimal,
+    /// Converted and measured, and the result was not enough smaller to be worth
+    /// replacing the original with. Distinct from [`SkipReason::AlreadyOptimal`]
+    /// because the answer to "why was this left alone" is the opposite: the work
+    /// was done and the file simply did not shrink.
+    NoGain,
     /// Lossy source with no lossless path to a smaller file.
     LossyNoGain,
     /// Would not fit in the staging budget.
@@ -141,8 +147,9 @@ pub enum SkipReason {
 impl SkipReason {
     /// Every reason, so callers can ask about all of them without a list of their
     /// own going stale. `covers_every_reason` holds this to the enum.
-    pub const ALL: [SkipReason; 12] = [
+    pub const ALL: [SkipReason; 13] = [
         SkipReason::AlreadyOptimal,
+        SkipReason::NoGain,
         SkipReason::LossyNoGain,
         SkipReason::TooLargeForBudget,
         SkipReason::TooSmall,
@@ -193,6 +200,7 @@ impl SkipReason {
     pub fn as_str(self) -> &'static str {
         match self {
             SkipReason::AlreadyOptimal => "already_optimal",
+            SkipReason::NoGain => "no_gain",
             SkipReason::LossyNoGain => "lossy_no_gain",
             SkipReason::TooLargeForBudget => "too_large_for_budget",
             SkipReason::TooSmall => "too_small",
@@ -539,6 +547,7 @@ mod tests {
             // Exhaustive by construction: a new variant stops this compiling.
             let _: () = match reason {
                 SkipReason::AlreadyOptimal
+                | SkipReason::NoGain
                 | SkipReason::LossyNoGain
                 | SkipReason::TooLargeForBudget
                 | SkipReason::TooSmall

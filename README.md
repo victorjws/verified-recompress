@@ -458,7 +458,8 @@ drive still full" is answerable from `plan` and `report`.
 
 | Reason | Meaning |
 | --- | --- |
-| `already_optimal` | already HEIC/AVIF/JXL; re-encoding would only add loss |
+| `already_optimal` | already HEIC/AVIF/JXL. Decided from the name alone; nothing was fetched |
+| `no_gain` | fetched, converted and measured, and the result was under 3% smaller |
 | `lossy_no_gain` | lossy source with no lossless path to a smaller file (MP3, AAC, AAC-in-`.m4a`, lossy WebP) |
 | `too_small` | under 4 KiB, or zero bytes |
 | `too_large_for_budget` | would not fit in the staging budget |
@@ -472,8 +473,10 @@ drive still full" is answerable from `plan` and `report`.
 | `unsupported` | nothing here is known to be improvable |
 | `out_of_scope` | excluded by `--path` or `--exclude` |
 
-Conversions projected to save less than 3% are not worth the upload, the risk, or the loss of the
-original's exact bytes, and are dropped.
+Conversions that save less than 3% are not worth the upload, the risk, or the loss of the
+original's exact bytes, and are dropped as `no_gain`. That is a different answer from
+`already_optimal`, which is reached from the file's name before anything is fetched: one says the
+work was done and the file did not shrink, the other says it was never attempted.
 
 Two reasons depend on how the run was configured rather than on the file: `video_tier_disabled`
 and `too_large_for_budget`. Those are automatically reconsidered on the next run when the settings
@@ -505,7 +508,7 @@ Other things worth knowing:
 ## Development
 
 ```sh
-cargo test          # 359 tests
+cargo test          # 360 tests
 cargo build --release
 ```
 

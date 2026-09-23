@@ -483,7 +483,9 @@ impl<R: Remote + 'static> Pipeline<R> {
 
         let output_bytes = tokio::fs::metadata(&output).await?.len();
         if !is_worthwhile(row.size, output_bytes) {
-            return self.record_skip(&row.path, SkipReason::AlreadyOptimal).await;
+            // Not "already optimal": the file was fetched, converted and
+            // measured. It just did not shrink enough to be worth the swap.
+            return self.record_skip(&row.path, SkipReason::NoGain).await;
         }
 
         if !opts.execute {
@@ -872,6 +874,22 @@ async fn read_head(path: &std::path::Path) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// "Already optimal" and "converted, but did not shrink" are opposite
+    /// answers to why a file was left alone — one never fetched it, the other
+    /// did all the work — and sharing a name made the question unanswerable
+    /// from the ledger.
+    #[test]
+    fn not_shrinking_is_reported_apart_from_being_already_optimal() {
+        assert_eq!(SkipReason::NoGain.as_str(), "no_gain");
+        assert_ne!(
+            SkipReason::NoGain.as_str(),
+            SkipReason::AlreadyOptimal.as_str()
+        );
+        // The threshold that decides it.
+        assert!(!is_worthwhile(1000, 971), "under 3% is no gain");
+        assert!(is_worthwhile(1000, 970), "3% clears it");
+    }
 
     /// `Path::join` throws away everything before an absolute path, so a single
     /// leading slash would put the original at the filesystem root instead of
