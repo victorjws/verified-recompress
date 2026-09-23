@@ -271,6 +271,21 @@ nothing to the remote.
 Work is scheduled per file with separate semaphores for disk, network, CPU and API calls, so a job
 waiting for a core does not hold a network slot.
 
+#### Resuming after an interruption
+
+A killed run leaves two things worth keeping, and the next run picks both up.
+
+The download, if it was complete. A job directory records what it is for before
+the bytes arrive, so leftovers can be told apart; a short file is swept rather than
+fed to an encoder as though it were whole. Half-written encoder output is never
+reused — neither SVT-AV1 nor ffmpeg can resume one, so it can only be a truncated
+file that verification would reject.
+
+The CRF, once found. Searching for one costs several sample encodes each scored by
+VMAF, measured at about four fifths of the work of converting a short clip. It is
+recorded as soon as it is known and reused for the same preset, so an interrupted
+run does not pay for it twice.
+
 ### `report`
 
 Shows three quantities that must never be conflated: logical bytes removed from the content, the
@@ -428,7 +443,7 @@ Other things worth knowing:
 ## Development
 
 ```sh
-cargo test          # 326 tests
+cargo test          # 339 tests
 cargo build --release
 ```
 

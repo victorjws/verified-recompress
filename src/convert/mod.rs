@@ -107,9 +107,17 @@ pub struct VideoOptions {
 }
 
 impl VideoOptions {
+    /// The preset this run will actually encode at, with the default resolved.
+    ///
+    /// A cached CRF only holds for the preset it was found at, so the caller
+    /// needs the resolved figure rather than the `Option`.
+    pub fn preset_used(self) -> u8 {
+        self.preset.unwrap_or(video_av1::DEFAULT_PRESET)
+    }
+
     fn settings(self) -> video_av1::Settings {
         video_av1::Settings {
-            preset: self.preset.unwrap_or(video_av1::DEFAULT_PRESET),
+            preset: self.preset_used(),
             temporal_filtering: !self.temporal_filtering_off,
             hwaccel: self.hwaccel,
         }
@@ -142,27 +150,28 @@ pub async fn encode(
     }
 }
 
+/// Where one encode happens: the files it reads and writes, the scratch space
+/// it may use, and the cores it was granted.
+#[derive(Debug, Clone, Copy)]
+pub struct Workbench<'a> {
+    pub input: &'a Path,
+    pub output: &'a Path,
+    pub work_dir: &'a Path,
+    pub cores: &'a [usize],
+}
+
 /// Encodes to AV1 and proves the result clears the quality gate.
+///
+/// `hint` is a CRF that suited this file last time, if one is on record.
+/// `report` is `Send` because the pipeline runs files on spawned tasks.
 pub async fn convert_av1(
-    input: &Path,
-    output: &Path,
+    bench: Workbench<'_>,
     probe: &crate::classify::MediaProbe,
-    work_dir: &Path,
-    cores: &[usize],
     video: VideoOptions,
-    // `Send` because the pipeline runs files on spawned tasks.
+    hint: Option<u8>,
     report: &mut (dyn FnMut(video_av1::Stage) + Send),
 ) -> Result<(Fidelity, video_av1::Attempt)> {
-    video_av1::encode_to_gate(
-        input,
-        output,
-        probe,
-        &video.settings(),
-        work_dir,
-        cores,
-        report,
-    )
-    .await
+    video_av1::encode_to_gate(bench, probe, &video.settings(), hint, report).await
 }
 
 /// Proves the encode preserved what the recipe promises.

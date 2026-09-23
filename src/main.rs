@@ -206,9 +206,18 @@ async fn run_plan(cfg: &Config) -> Result<()> {
 
 /// Converts files. Without `--execute` this stops short of touching the remote.
 async fn run_convert(cfg: &Config, args: &RunArgs) -> Result<()> {
-    let swept = staging::sweep_orphans(&cfg.staging_dir)?;
-    if swept > 0 {
-        tracing::info!("cleared {swept} staging director(ies) left by a previous run");
+    let salvage = staging::salvage_orphans(&cfg.staging_dir)?;
+    if salvage.swept > 0 {
+        tracing::info!(
+            "cleared {} staging director(ies) left by a previous run",
+            salvage.swept
+        );
+    }
+    if !salvage.reusable.is_empty() {
+        tracing::info!(
+            "reusing {} download(s) a previous run had already fetched",
+            salvage.reusable.len()
+        );
     }
 
     let ledger = Ledger::open(&cfg.staging_dir.join("ledger.sqlite"))?;
@@ -268,6 +277,7 @@ async fn run_convert(cfg: &Config, args: &RunArgs) -> Result<()> {
         cfg.staging_dir.clone(),
         u64::from(cfg.max_file_mib) * 1024 * 1024,
         cancel,
+        salvage.reusable,
     ));
 
     if !args.execute {

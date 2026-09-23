@@ -61,6 +61,15 @@ pub struct FileRow {
     pub blake3: Option<String>,
     pub state: State,
     pub skip_reason: Option<String>,
+    /// A CRF already known to suit this file, and the preset it was found at.
+    ///
+    /// Searching for one costs several sample encodes, each scored by VMAF —
+    /// measured at four fifths of the work of converting a short clip. A run
+    /// that is interrupted, or a file that has to be retried, should not pay it
+    /// twice. The preset comes along because the answer only holds for the
+    /// preset it was found at.
+    pub crf_hint: Option<u8>,
+    pub crf_hint_preset: Option<u8>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -95,6 +104,12 @@ enum Cmd {
         prefixes: Vec<String>,
         order: Order,
         reply: oneshot::Sender<Result<Option<FileRow>>>,
+    },
+    RecordCrfHint {
+        path: String,
+        crf: u8,
+        preset: u8,
+        reply: oneshot::Sender<Result<()>>,
     },
     SetState {
         path: String,
@@ -291,6 +306,21 @@ impl Ledger {
         .await
     }
 
+    /// Remembers a CRF that suited this file at `preset`.
+    ///
+    /// Written as soon as it is known rather than when the file completes, so an
+    /// interrupted run still saves the next one the search.
+    pub async fn record_crf_hint(&self, path: &str, crf: u8, preset: u8) -> Result<()> {
+        let path = path.to_string();
+        self.send(|reply| Cmd::RecordCrfHint {
+            path,
+            crf,
+            preset,
+            reply,
+        })
+        .await
+    }
+
     pub async fn set_state(
         &self,
         path: &str,
@@ -402,6 +432,9 @@ fn migrate(conn: &Connection) -> Result<()> {
         ("trashed_at", "TEXT"),
         // Set once the space has genuinely been reclaimed.
         ("reclaimed", "INTEGER NOT NULL DEFAULT 0"),
+        // A CRF already known to suit this file, with the preset it holds for.
+        ("crf_hint", "INTEGER"),
+        ("crf_hint_preset", "INTEGER"),
         // What `Order::Savings` sorts on. A ledger predating this column reads as
         // zero everywhere, which degrades that order to the size tiebreaker until
         // the next scan rather than producing a wrong one.
@@ -445,6 +478,14 @@ fn actor_loop(mut conn: Connection, mut rx: mpsc::Receiver<Cmd>) {
                 reply,
             } => {
                 let _ = reply.send(do_claim_next(&mut conn, &prefixes, order));
+            }
+            Cmd::RecordCrfHint {
+                path,
+                crf,
+                preset,
+                reply,
+            } => {
+                let _ = reply.send(do_record_crf_hint(&conn, &path, crf, preset));
             }
             Cmd::SetState {
                 path,
@@ -563,6 +604,8 @@ struct RawRow {
     blake3: Option<String>,
     state: String,
     skip_reason: Option<String>,
+    crf_hint: Option<u8>,
+    crf_hint_preset: Option<u8>,
 }
 
 fn row_to_file(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRow> {
@@ -573,6 +616,8 @@ fn row_to_file(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRow> {
         blake3: row.get(3)?,
         state: row.get(4)?,
         skip_reason: row.get(5)?,
+        crf_hint: row.get(6)?,
+        crf_hint_preset: row.get(7)?,
     })
 }
 
@@ -584,13 +629,15 @@ fn build_row(raw: RawRow) -> Result<FileRow> {
         blake3: raw.blake3,
         state: State::parse(&raw.state)?,
         skip_reason: raw.skip_reason,
+        crf_hint: raw.crf_hint,
+        crf_hint_preset: raw.crf_hint_preset,
     })
 }
 
 fn do_get(conn: &Connection, path: &str) -> Result<Option<FileRow>> {
     let raw = conn
         .query_row(
-            "SELECT path, size, mod_time, blake3, state, skip_reason FROM files WHERE path = ?1",
+            "SELECT path, size, mod_time, blake3, state, skip_reason, crf_hint, crf_hint_preset\n             FROM files WHERE path = ?1",
             params![path],
             row_to_file,
         )
@@ -625,7 +672,7 @@ fn do_counts(conn: &Connection) -> Result<Counts> {
 
 fn do_list_by_state(conn: &Connection, state: State) -> Result<Vec<FileRow>> {
     let mut stmt = conn.prepare(
-        "SELECT path, size, mod_time, blake3, state, skip_reason
+        "SELECT path, size, mod_time, blake3, state, skip_reason, crf_hint, crf_hint_preset
          FROM files WHERE state = ?1 ORDER BY size DESC, path",
     )?;
     let rows = stmt.query_map(params![state.as_str()], row_to_file)?;
@@ -641,7 +688,7 @@ fn do_claim_next(
     let tx = conn.transaction()?;
     let (filter, params) = prefix_filter(prefixes);
     let sql = format!(
-        "SELECT path, size, mod_time, blake3, state, skip_reason
+        "SELECT path, size, mod_time, blake3, state, skip_reason, crf_hint, crf_hint_preset
          FROM files WHERE state = 'pending'{filter} ORDER BY {} LIMIT 1",
         order_clause(order)
     );
@@ -706,6 +753,17 @@ fn escape_like(value: &str) -> String {
         .replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
+}
+
+fn do_record_crf_hint(conn: &Connection, path: &str, crf: u8, preset: u8) -> Result<()> {
+    // A hint is an optimisation, not a record. If the row went away — swept
+    // because the file is no longer on the remote — there is nothing to attach
+    // it to and nothing lost.
+    conn.execute(
+        "UPDATE files SET crf_hint = ?2, crf_hint_preset = ?3 WHERE path = ?1",
+        params![path, crf, preset],
+    )?;
+    Ok(())
 }
 
 fn do_set_state(
@@ -1064,6 +1122,34 @@ mod tests {
         ledger.sync("photos", vec![]).await.unwrap();
         assert!(ledger.get("photos/a.jpg").await.unwrap().is_none());
         assert!(ledger.get("photos-backup/a.jpg").await.unwrap().is_some());
+    }
+
+    /// The search costs several sample encodes scored by VMAF — four fifths of
+    /// the work of converting a short clip — so an interrupted run has to leave
+    /// the answer behind.
+    #[tokio::test]
+    async fn a_crf_hint_survives_for_the_next_attempt() {
+        let ledger = Ledger::open_in_memory().unwrap();
+        ledger.sync("", vec![entry("a.mkv", 100_000)]).await.unwrap();
+        assert_eq!(ledger.get("a.mkv").await.unwrap().unwrap().crf_hint, None);
+
+        ledger.record_crf_hint("a.mkv", 27, 3).await.unwrap();
+        let row = ledger.get("a.mkv").await.unwrap().unwrap();
+        assert_eq!(row.crf_hint, Some(27));
+        assert_eq!(row.crf_hint_preset, Some(3));
+
+        // And it reaches the pipeline through the claim, not just a lookup.
+        let claimed = ledger.claim_next(&[], Order::Size).await.unwrap().unwrap();
+        assert_eq!(claimed.crf_hint, Some(27));
+        assert_eq!(claimed.crf_hint_preset, Some(3));
+    }
+
+    /// A hint is an optimisation. Recording one for a row that has since been
+    /// swept must not fail the conversion that produced it.
+    #[tokio::test]
+    async fn a_hint_for_a_vanished_row_is_not_an_error() {
+        let ledger = Ledger::open_in_memory().unwrap();
+        assert!(ledger.record_crf_hint("gone.mkv", 27, 3).await.is_ok());
     }
 
     /// The whole point of the single-writer actor: concurrent claims cannot collide.

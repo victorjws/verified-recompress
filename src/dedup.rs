@@ -159,6 +159,8 @@ mod tests {
             blake3: hash.map(str::to_string),
             state: State::Pending,
             skip_reason: None,
+            crf_hint: None,
+            crf_hint_preset: None,
         }
     }
 

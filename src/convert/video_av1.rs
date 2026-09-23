@@ -147,12 +147,17 @@ pub async fn search_crf(input: &Path, settings: &Settings, cores: &[usize]) -> R
 }
 
 /// Pulls the chosen CRF out of ab-av1's report.
+///
+/// ab-av1 searches a continuous scale and reports fractions: "crf 34.25 VMAF
+/// 97.12 ...". SVT-AV1 takes whole numbers, so the answer is rounded down —
+/// towards higher quality, since a lower CRF is the safer side of a gate the
+/// full encode still has to clear on its own.
 fn parse_crf(text: &str) -> Option<u8> {
-    // Lines look like "crf 27 VMAF 97.31 predicted video stream size ...".
     text.lines()
         .filter_map(|line| {
             let rest = line.trim().strip_prefix("crf ")?;
-            rest.split_whitespace().next()?.parse::<u8>().ok()
+            let value: f64 = rest.split_whitespace().next()?.parse().ok()?;
+            (value.is_finite() && value >= 0.0).then(|| value.floor().min(63.0) as u8)
         })
         .next_back()
 }
@@ -188,26 +193,42 @@ pub const ATTEMPTS: u8 = MAX_ATTEMPTS;
 /// The search only samples scenes, so its answer is a starting point rather than
 /// a verdict: the full encode is always measured in its own right.
 pub async fn encode_to_gate(
-    input: &Path,
-    output: &Path,
+    bench: super::Workbench<'_>,
     probe: &MediaProbe,
     settings: &Settings,
-    work_dir: &Path,
-    cores: &[usize],
+    hint: Option<u8>,
     report: &mut (dyn FnMut(Stage) + Send),
 ) -> Result<(Fidelity, Attempt)> {
+    let super::Workbench {
+        input,
+        output,
+        work_dir,
+        cores,
+    } = bench;
     let video = probe
         .video
         .first()
         .context("no video stream to encode")?;
     let model = vmaf::model_for(video.width, video.height);
 
-    report(Stage::CrfSearch);
-    let mut crf = match search_crf(input, settings, cores).await {
-        Ok(crf) => crf,
-        Err(e) => {
-            tracing::debug!("CRF search unavailable ({e:#}); starting from {FALLBACK_CRF}");
-            FALLBACK_CRF
+    // A hint from a previous attempt at this file is worth more than a fresh
+    // search: it cost the same sample encodes to find, and the file has not
+    // changed. The full encode is still measured on its own, so a stale hint
+    // costs an attempt rather than a wrong answer.
+    let mut crf = match hint {
+        Some(crf) => {
+            tracing::debug!("reusing crf {crf} from a previous attempt");
+            crf
+        }
+        None => {
+            report(Stage::CrfSearch);
+            match search_crf(input, settings, cores).await {
+                Ok(crf) => crf,
+                Err(e) => {
+                    tracing::debug!("CRF search unavailable ({e:#}); starting from {FALLBACK_CRF}");
+                    FALLBACK_CRF
+                }
+            }
         }
     };
 
@@ -254,6 +275,40 @@ pub async fn encode_to_gate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Captured from ab-av1 0.11.7. It reports fractional CRFs, which an integer
+    /// parse silently rejected — so the search "failed" on every real run and
+    /// every AV1 conversion quietly fell back to a fixed CRF, having paid for
+    /// the search anyway.
+    #[test]
+    fn a_fractional_crf_is_read_and_rounded_towards_quality() {
+        let report = "\
+[INFO ab_av1::command::sample_encode] crf 37.5 VMAF 96.24 predicted video stream size 4.38 MiB (45%)
+[INFO ab_av1::command::crf_search] crf 37.5 VMAF 96.24 (45%)
+crf 34.25 VMAF 97.12 predicted video stream size 5.98 MiB (61%) taking 12 seconds";
+        assert_eq!(parse_crf(report), Some(34), "34.25 rounds down, not up");
+    }
+
+    #[test]
+    fn a_whole_crf_still_parses() {
+        assert_eq!(parse_crf("crf 27 VMAF 97.31 predicted video stream size"), Some(27));
+    }
+
+    /// The last line is the verdict; the ones before it are samples along the way.
+    #[test]
+    fn the_final_line_wins() {
+        assert_eq!(parse_crf("crf 45 VMAF 90\ncrf 30 VMAF 96\ncrf 28 VMAF 97"), Some(28));
+    }
+
+    #[test]
+    fn nonsense_is_not_a_crf() {
+        assert_eq!(parse_crf("no crf here"), None);
+        assert_eq!(parse_crf("crf notanumber VMAF 90"), None);
+        assert_eq!(parse_crf("crf -3 VMAF 90"), None);
+        assert_eq!(parse_crf(""), None);
+        // Past what SVT-AV1 accepts, clamped rather than wrapped.
+        assert_eq!(parse_crf("crf 300 VMAF 10"), Some(63));
+    }
 
     /// The gate is scored with VMAF, so the encoder must not be tuned for it.
     #[test]

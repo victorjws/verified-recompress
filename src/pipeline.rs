@@ -25,7 +25,7 @@ use crate::ledger::{Conversion, FileRow, Ledger, State};
 use crate::policy::{self, Decision, Facts, Limits, Recipe, SkipReason};
 use crate::remote::Remote;
 use crate::scope::Scope;
-use crate::staging::Workspace;
+use crate::staging::{self, Workspace};
 
 /// How much of a file to read when confirming an ambiguous extension.
 const HEAD_BYTES: usize = 188 * 8;
@@ -92,6 +92,9 @@ pub struct Pipeline<R: Remote + 'static> {
     staging_dir: std::path::PathBuf,
     max_file_bytes: u64,
     cancel: CancellationToken,
+    /// Downloads a previous run already fetched, by remote path. Each is used at
+    /// most once; taking it out is what stops two jobs adopting the same one.
+    salvaged: std::sync::Mutex<std::collections::HashMap<String, std::path::PathBuf>>,
     next_job_id: AtomicU64,
 }
 
@@ -103,6 +106,7 @@ impl<R: Remote + 'static> Pipeline<R> {
         staging_dir: std::path::PathBuf,
         max_file_bytes: u64,
         cancel: CancellationToken,
+        salvaged: std::collections::HashMap<String, std::path::PathBuf>,
     ) -> Self {
         Self {
             board: Arc::new(crate::progress::Board::start(None)),
@@ -112,6 +116,7 @@ impl<R: Remote + 'static> Pipeline<R> {
             staging_dir,
             max_file_bytes,
             cancel,
+            salvaged: std::sync::Mutex::new(salvaged),
             next_job_id: AtomicU64::new(0),
         }
     }
@@ -176,6 +181,30 @@ impl<R: Remote + 'static> Pipeline<R> {
         Ok(summary)
     }
 
+    /// Takes a salvaged download for `path`, if one is there and still current.
+    ///
+    /// Removed from the index whether or not it matches: a stale directory is
+    /// not going to become current, and leaving it would keep it from being
+    /// swept at the end of the run.
+    fn take_salvaged(
+        &self,
+        path: &str,
+        claimed: &staging::Claimed,
+    ) -> Option<std::path::PathBuf> {
+        let dir = self.salvaged.lock().ok()?.remove(path)?;
+        match staging::read_claimed(&dir) {
+            Some(found) if staging::still_matches(&found, claimed.size, claimed.mod_time.as_deref()) => {
+                Some(dir)
+            }
+            _ => {
+                // The remote has moved on since that download. Nothing here is
+                // usable, and it is still occupying the staging budget.
+                let _ = std::fs::remove_dir_all(&dir);
+                None
+            }
+        }
+    }
+
     /// Restates the run as a whole, so a file-level line is never the only thing
     /// on screen.
     fn show(&self, summary: &Summary, started: usize) {
@@ -238,11 +267,34 @@ impl<R: Remote + 'static> Pipeline<R> {
         let _disk = self.governor.disk(reservation).await?;
 
         let job_id = self.next_job_id.fetch_add(1, Ordering::Relaxed);
-        let workspace = Workspace::create(&self.staging_dir, job_id)?;
-        let input = workspace.input(&row.path);
+        let claimed = staging::Claimed {
+            path: row.path.clone(),
+            size: row.size,
+            mod_time: row.mod_time.clone(),
+        };
 
-        slot.stage("downloading");
-        {
+        // A download this file already has from an interrupted run is worth more
+        // than anything else here: it may be gigabytes, and fetching it again is
+        // the most expensive thing a retry can do.
+        let workspace = match self.take_salvaged(&row.path, &claimed) {
+            Some(dir) => Workspace::adopt(&self.staging_dir, job_id, &dir)?,
+            None => Workspace::create(&self.staging_dir, job_id)?,
+        };
+        let input = workspace.input(&row.path);
+        // `adopt` moved the directory whole, so the download is there or it was
+        // never salvaged; either way the file on disk is the authority.
+        let reused = input.exists();
+        if !reused {
+            // Before the bytes, so a process killed mid-download still leaves
+            // something that says what the directory was for.
+            workspace.claim(&claimed)?;
+        }
+
+        if reused {
+            slot.stage("reusing download");
+            tracing::debug!("{}: reusing the download from a previous run", row.path);
+        } else {
+            slot.stage("downloading");
             let _net = self.governor.network().await;
             self.remote
                 .download(&row.path, &input, |t| {
@@ -288,16 +340,33 @@ impl<R: Remote + 'static> Pipeline<R> {
                 .context("AV1 requires a probe, which should have been taken already")?;
             let cpu = self.governor.cpu(recipe).await;
             let duration = probe.duration_secs;
+            // Only for the preset it was found at; a different one puts the
+            // encoder on a different curve entirely.
+            let hint = row
+                .crf_hint
+                .filter(|_| row.crf_hint_preset == Some(opts.video.preset_used()));
             let (fidelity, attempt) = convert::convert_av1(
-                &input,
-                &output,
+                convert::Workbench {
+                    input: &input,
+                    output: &output,
+                    work_dir: workspace.path(),
+                    cores: cpu.cores(),
+                },
                 probe,
-                workspace.path(),
-                cpu.cores(),
                 opts.video,
+                hint,
                 &mut |stage| slot.detail(describe_stage(stage, duration)),
             )
             .await?;
+
+            // Recorded as soon as it is known, so an interrupted run still
+            // saves the next one the search.
+            if hint != Some(attempt.crf) {
+                let _ = self
+                    .ledger
+                    .record_crf_hint(&row.path, attempt.crf, opts.video.preset_used())
+                    .await;
+            }
             tracing::info!("{}: crf {}, {}", row.path, attempt.crf, attempt.scores.summary());
             fidelity
         } else {
