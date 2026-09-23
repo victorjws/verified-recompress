@@ -139,17 +139,55 @@ pub enum SkipReason {
 }
 
 impl SkipReason {
+    /// Every reason, so callers can ask about all of them without a list of their
+    /// own going stale. `covers_every_reason` holds this to the enum.
+    pub const ALL: [SkipReason; 12] = [
+        SkipReason::AlreadyOptimal,
+        SkipReason::LossyNoGain,
+        SkipReason::TooLargeForBudget,
+        SkipReason::TooSmall,
+        SkipReason::VideoHdr,
+        SkipReason::VideoAlreadyAv1,
+        SkipReason::VideoLowBitrate,
+        SkipReason::VideoTooShort,
+        SkipReason::VideoComplexStructure,
+        SkipReason::VideoTierDisabled,
+        SkipReason::NeedsProbe,
+        SkipReason::Unsupported,
+    ];
+
     /// Whether this verdict depends on how the run was configured rather than on
     /// the file itself.
     ///
-    /// A file left alone because `--allow-video` was absent, or because the staging
-    /// budget was small, must be reconsidered when those change. A file left alone
-    /// because it is HDR or already AV1 never needs looking at again.
+    /// A file left alone because `--allow-video` was absent, because the staging
+    /// budget was small, or because it fell under the duration floor must be
+    /// reconsidered when those change. A file left alone because it is HDR or
+    /// already AV1 never needs looking at again.
+    ///
+    /// This is the list a run reopens from. Keeping a second copy at the call
+    /// site is how the two drift apart, which is exactly what happened to the
+    /// duration floor.
     pub fn depends_on_settings(self) -> bool {
         matches!(
             self,
-            SkipReason::VideoTierDisabled | SkipReason::TooLargeForBudget
+            SkipReason::VideoTierDisabled
+                | SkipReason::TooLargeForBudget
+                | SkipReason::VideoTooShort
         )
+    }
+
+    /// Reasons a run should reconsider, given how it was configured.
+    ///
+    /// `video_tier_disabled` is left alone unless video is actually permitted:
+    /// reopening it otherwise means claiming every video on the drive only to
+    /// set it straight back.
+    pub fn reopened_by(allow_video: bool) -> Vec<&'static str> {
+        Self::ALL
+            .iter()
+            .filter(|reason| reason.depends_on_settings())
+            .filter(|reason| allow_video || **reason != SkipReason::VideoTierDisabled)
+            .map(|reason| reason.as_str())
+            .collect()
     }
 
     pub fn as_str(self) -> &'static str {
@@ -493,6 +531,63 @@ mod tests {
     /// A typical 1080p phone clip: the case the whole video tier exists for.
     fn phone_clip() -> MediaProbe {
         video("h264", 1920, 1080, 12_000_000, 120.0)
+    }
+
+    #[test]
+    fn all_covers_every_reason() {
+        for reason in SkipReason::ALL {
+            // Exhaustive by construction: a new variant stops this compiling.
+            let _: () = match reason {
+                SkipReason::AlreadyOptimal
+                | SkipReason::LossyNoGain
+                | SkipReason::TooLargeForBudget
+                | SkipReason::TooSmall
+                | SkipReason::VideoHdr
+                | SkipReason::VideoAlreadyAv1
+                | SkipReason::VideoLowBitrate
+                | SkipReason::VideoTooShort
+                | SkipReason::VideoComplexStructure
+                | SkipReason::VideoTierDisabled
+                | SkipReason::NeedsProbe
+                | SkipReason::Unsupported => (),
+            };
+        }
+        let names: std::collections::BTreeSet<_> =
+            SkipReason::ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(names.len(), SkipReason::ALL.len(), "duplicate or missing name");
+    }
+
+    /// The duration floor is a setting, and it was missing here while a
+    /// hand-written copy at the call site had it. One list, or they drift.
+    #[test]
+    fn settings_dependent_reasons_are_the_ones_a_run_reopens() {
+        for reason in [
+            SkipReason::TooLargeForBudget,
+            SkipReason::VideoTierDisabled,
+            SkipReason::VideoTooShort,
+        ] {
+            assert!(reason.depends_on_settings(), "{}", reason.as_str());
+        }
+        // Properties of the file, not of the run. Reopening these would claim
+        // them every time only to reach the same verdict.
+        for reason in [
+            SkipReason::VideoHdr,
+            SkipReason::VideoAlreadyAv1,
+            SkipReason::AlreadyOptimal,
+            SkipReason::TooSmall,
+            SkipReason::Unsupported,
+        ] {
+            assert!(!reason.depends_on_settings(), "{}", reason.as_str());
+        }
+    }
+
+    #[test]
+    fn the_video_tier_is_only_reopened_when_it_is_permitted() {
+        let without = SkipReason::reopened_by(false);
+        assert!(!without.contains(&"video_tier_disabled"));
+        assert!(without.contains(&"too_large_for_budget"));
+        assert!(without.contains(&"video_too_short"));
+        assert!(SkipReason::reopened_by(true).contains(&"video_tier_disabled"));
     }
 
     #[test]

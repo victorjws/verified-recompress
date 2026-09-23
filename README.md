@@ -266,6 +266,7 @@ nothing to the remote.
 | `--order savings\|size\|path` | order files are picked up in (default `savings`) |
 | `--min-video-secs SECONDS` | leave videos shorter than this alone (default `0`, meaning convert every length) |
 | `--preset N` | SVT-AV1 preset. Lower is smaller and slower |
+| `--no-temporal-filtering` | turn off SVT-AV1 temporal filtering. Costs 4-8% BD-rate, reduces oversmoothing |
 | `--allow-discard-corrupt` | let ffmpeg drop corrupt MPEG-TS packets. **This makes the remux lossy** |
 | `--trash-policy keep\|purge-after-days\|purge-now` | when to empty the trash (default `keep`) |
 | `--purge-after-days DAYS` | retention for `purge-after-days` (default 30) |
@@ -412,7 +413,7 @@ purge_after_days = 30
 | `paths` | whole remote | CLI `--path` replaces this list entirely |
 | `exclude` | none | CLI `--exclude` is appended to this list |
 | `trash_policy` | `keep` | `keep`, `purge_after_days`, or `purge_now` |
-| `purge_after_days` | 30 | only used by `purge_after_days` |
+| `purge_after_days` | 30 | retention for `purge_after_days`. Emptying is all or nothing, so the trash waits for its youngest file |
 
 `--path` scoping is enforced at every stage, not just during `scan`, and prefixes are matched on
 path-segment boundaries so `/photos` never picks up `/photos-backup`.
@@ -485,7 +486,7 @@ Other things worth knowing:
 ## Development
 
 ```sh
-cargo test          # 346 tests
+cargo test          # 352 tests
 cargo build --release
 ```
 

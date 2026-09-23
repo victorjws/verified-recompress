@@ -61,7 +61,10 @@ pub enum Command {
     },
 
     /// Convert files. Without --execute this is a dry run.
-    Run(RunArgs),
+    ///
+    /// Boxed because `RunArgs` carries every tuning knob and would otherwise set
+    /// the size of this enum for the subcommands that take no arguments at all.
+    Run(Box<RunArgs>),
 
     /// Show logical savings, actual quota change, and trash pending.
     Report,
@@ -163,6 +166,11 @@ pub struct RunArgs {
     /// SVT-AV1 preset. Lower is smaller and slower.
     #[arg(long, value_name = "N")]
     pub preset: Option<u8>,
+
+    /// Turn off SVT-AV1 temporal filtering. Costs 4-8% BD-rate and reduces
+    /// oversmoothing; `bench` measures the trade on your own files.
+    #[arg(long)]
+    pub no_temporal_filtering: bool,
 
     /// Permit ffmpeg to drop corrupt MPEG-TS packets. This makes the remux lossy.
     #[arg(long)]

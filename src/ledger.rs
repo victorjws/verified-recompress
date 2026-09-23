@@ -131,6 +131,10 @@ enum Cmd {
     PendingReclaim {
         reply: oneshot::Sender<Result<Reclaim>>,
     },
+    PendingReclaimAged {
+        days: u32,
+        reply: oneshot::Sender<Result<Aged>>,
+    },
     MarkReclaimed {
         reply: oneshot::Sender<Result<u64>>,
     },
@@ -182,6 +186,22 @@ pub struct Sync {
     pub seen: usize,
     /// Rows dropped because the file is no longer on the remote.
     pub removed: usize,
+}
+
+/// The trash, split by whether a retention period has run out on it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Aged {
+    /// Everything waiting, regardless of age.
+    pub pending: Reclaim,
+    /// How many of those were trashed too recently to purge yet.
+    pub too_recent: u64,
+}
+
+impl Aged {
+    /// Whether the whole trash can go without breaking the retention promise.
+    pub fn ready(&self) -> bool {
+        self.pending.files > 0 && self.too_recent == 0
+    }
 }
 
 /// Originals sitting in the trash, still counted against the quota.
@@ -364,6 +384,17 @@ impl Ledger {
         self.send(|reply| Cmd::PendingReclaim { reply }).await
     }
 
+    /// What is in the trash, and how much of it is younger than `days`.
+    ///
+    /// The second figure is what a retention policy turns on. Emptying the trash
+    /// is all-or-nothing — rclone offers no way to purge by age — so a promise
+    /// not to destroy anything younger than `days` can only be kept by waiting
+    /// until nothing is.
+    pub async fn pending_reclaim_aged(&self, days: u32) -> Result<Aged> {
+        self.send(|reply| Cmd::PendingReclaimAged { days, reply })
+            .await
+    }
+
     /// Records that the trash has been emptied. Returns the bytes reclaimed.
     pub async fn mark_reclaimed(&self) -> Result<u64> {
         self.send(|reply| Cmd::MarkReclaimed { reply }).await
@@ -506,6 +537,9 @@ fn actor_loop(mut conn: Connection, mut rx: mpsc::Receiver<Cmd>) {
             }
             Cmd::PendingReclaim { reply } => {
                 let _ = reply.send(do_pending_reclaim(&conn));
+            }
+            Cmd::PendingReclaimAged { days, reply } => {
+                let _ = reply.send(do_pending_reclaim_aged(&conn, days));
             }
             Cmd::MarkReclaimed { reply } => {
                 let _ = reply.send(do_mark_reclaimed(&conn));
@@ -848,6 +882,24 @@ fn do_pending_reclaim(conn: &Connection) -> Result<Reclaim> {
     })
 }
 
+fn do_pending_reclaim_aged(conn: &Connection, days: u32) -> Result<Aged> {
+    let pending = do_pending_reclaim(conn)?;
+    // `trashed_at` is written with datetime('now'), so both sides of this are
+    // the same clock and the same format.
+    let cutoff = format!("-{days} days");
+    let too_recent: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM files
+         WHERE state = 'done' AND trashed_at IS NOT NULL AND reclaimed = 0
+           AND trashed_at > datetime('now', ?1)",
+        params![cutoff],
+        |row| row.get(0),
+    )?;
+    Ok(Aged {
+        pending,
+        too_recent: u64::try_from(too_recent).unwrap_or(0),
+    })
+}
+
 fn do_mark_reclaimed(conn: &Connection) -> Result<u64> {
     let pending = do_pending_reclaim(conn)?;
     conn.execute(
@@ -1127,6 +1179,78 @@ mod tests {
     /// The search costs several sample encodes scored by VMAF — four fifths of
     /// the work of converting a short clip — so an interrupted run has to leave
     /// the answer behind.
+    /// The retention policy claimed originals would be purged after a number of
+    /// days and never purged anything. Emptying is all or nothing — rclone
+    /// cannot purge by age — so the promise is kept by waiting until nothing in
+    /// the trash is younger than the period.
+    #[tokio::test]
+    async fn a_retention_period_waits_for_the_youngest_file() {
+        let ledger = Ledger::open_in_memory().unwrap();
+        ledger
+            .sync("", vec![entry("old.jpg", 100_000), entry("new.jpg", 100_000)])
+            .await
+            .unwrap();
+        for path in ["old.jpg", "new.jpg"] {
+            ledger
+                .record_conversion(conversion(path, 80_000))
+                .await
+                .unwrap();
+        }
+
+        // Both were just trashed, so a 30-day period holds everything back.
+        let aged = ledger.pending_reclaim_aged(30).await.unwrap();
+        assert_eq!(aged.pending.files, 2);
+        assert_eq!(aged.too_recent, 2);
+        assert!(!aged.ready(), "nothing has aged out yet");
+
+        // A zero-day period is satisfied at once.
+        let aged = ledger.pending_reclaim_aged(0).await.unwrap();
+        assert_eq!(aged.too_recent, 0);
+        assert!(aged.ready());
+    }
+
+    /// One recent file holds the whole trash back, which is the point: the
+    /// alternative is destroying it early.
+    #[tokio::test]
+    async fn one_recent_original_holds_back_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aged.sqlite");
+        let ledger = Ledger::open(&path).unwrap();
+        ledger
+            .sync("", vec![entry("old.jpg", 100_000), entry("new.jpg", 100_000)])
+            .await
+            .unwrap();
+        for name in ["old.jpg", "new.jpg"] {
+            ledger
+                .record_conversion(conversion(name, 80_000))
+                .await
+                .unwrap();
+        }
+        // Backdated directly: the ledger has no way to say "this was trashed two
+        // months ago", and waiting sixty days is not a test.
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE files SET trashed_at = datetime('now', '-60 days') WHERE path = 'old.jpg'",
+                [],
+            )
+            .unwrap();
+
+        let aged = ledger.pending_reclaim_aged(30).await.unwrap();
+        assert_eq!(aged.pending.files, 2, "both are still waiting");
+        assert_eq!(aged.too_recent, 1, "only the new one is too recent");
+        assert!(!aged.ready());
+    }
+
+    /// An empty trash is not "ready to purge"; there is nothing to purge.
+    #[tokio::test]
+    async fn an_empty_trash_is_not_ready() {
+        let ledger = Ledger::open_in_memory().unwrap();
+        let aged = ledger.pending_reclaim_aged(0).await.unwrap();
+        assert_eq!(aged.pending.files, 0);
+        assert!(!aged.ready());
+    }
+
     #[tokio::test]
     async fn a_crf_hint_survives_for_the_next_attempt() {
         let ledger = Ledger::open_in_memory().unwrap();

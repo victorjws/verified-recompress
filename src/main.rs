@@ -229,16 +229,8 @@ async fn run_convert(cfg: &Config, args: &RunArgs) -> Result<()> {
     // Skips caused by this run's settings, rather than by the files themselves,
     // have to be reconsidered when those settings change. Otherwise turning on
     // --allow-video would silently do nothing to files it had already excluded.
-    let mut reopen: Vec<&str> = vec![
-        SkipReason::TooLargeForBudget.as_str(),
-        // The duration floor is a setting too, so a run that lowers it has to
-        // reconsider what an earlier, stricter one passed over.
-        SkipReason::VideoTooShort.as_str(),
-        pipeline::OUT_OF_SCOPE,
-    ];
-    if args.allow_video {
-        reopen.push(SkipReason::VideoTierDisabled.as_str());
-    }
+    let mut reopen = SkipReason::reopened_by(args.allow_video);
+    reopen.push(pipeline::OUT_OF_SCOPE);
     let reopened = ledger.reopen_skipped(&reopen).await?;
     if reopened > 0 {
         tracing::info!("reconsidering {reopened} file(s) skipped under earlier settings");
@@ -306,7 +298,7 @@ async fn run_convert(cfg: &Config, args: &RunArgs) -> Result<()> {
             min_video_secs: cfg.min_video_secs,
             video: convert::VideoOptions {
                 preset: args.preset,
-                temporal_filtering_off: false,
+                temporal_filtering_off: args.no_temporal_filtering,
                 hwaccel: preflight::has_cuda().await,
                 allow_discard_corrupt: args.allow_discard_corrupt,
             },
@@ -337,6 +329,27 @@ async fn run_convert(cfg: &Config, args: &RunArgs) -> Result<()> {
     if args.execute && trash::purges_after_run(cfg.trash_policy) {
         tracing::info!("\nEmptying the trash as configured (trash_policy = purge_now)...");
         run_cleanup(cfg, true).await?;
+    } else if args.execute && cfg.trash_policy == TrashPolicy::PurgeAfterDays {
+        // All or nothing: rclone cannot purge by age, so the only way to keep
+        // the promise that nothing younger than the retention period is
+        // destroyed is to wait until nothing is.
+        let aged = ledger.pending_reclaim_aged(cfg.purge_after_days).await?;
+        if aged.ready() {
+            tracing::info!(
+                "\nEverything in the trash is older than {} day(s); emptying it.",
+                cfg.purge_after_days
+            );
+            run_cleanup(cfg, true).await?;
+        } else if aged.too_recent > 0 {
+            tracing::info!(
+                "\n  {} of {} original(s) in the trash are newer than {} day(s), so it \n  \
+                 stays. Emptying is all or nothing here, so it waits for the \n  \
+                 youngest. `cleanup --execute` overrides that.",
+                progress::thousands(aged.too_recent),
+                progress::thousands(aged.pending.files),
+                cfg.purge_after_days
+            );
+        }
     } else if args.execute && cfg.trash_policy == TrashPolicy::Keep {
         tracing::info!(
             "\n  Originals are in the trash, which still counts against your quota.\n  \
