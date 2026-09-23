@@ -320,6 +320,9 @@ async fn run_convert(cfg: &Config, args: &RunArgs) -> Result<()> {
             keep_originals: args.execute.then(|| cfg.keep_originals.clone()).flatten(),
             // Dry runs replace nothing, so there is nothing billed to reclaim.
             reclaim_when_low_mib: args.execute.then_some(cfg.reclaim_when_low_mib).flatten(),
+            // One job per core keeps the encoders fed; the network slots on top
+            // let that many more be fetching or uploading meanwhile.
+            max_in_flight: cfg.cpu_cores + cfg.net_concurrency,
             min_video_secs: cfg.min_video_secs,
             video: convert::VideoOptions {
                 preset: args.preset,

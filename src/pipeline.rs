@@ -83,6 +83,14 @@ pub struct Options {
     pub keep_originals: Option<std::path::PathBuf>,
     /// Empty the trash mid-run once remote free space falls below this many MiB.
     pub reclaim_when_low_mib: Option<u32>,
+    /// How many files may be in flight at once.
+    ///
+    /// Enough to keep every budget busy and no more. Claiming past that point
+    /// starts no work sooner — the job queues on a semaphore either way — but it
+    /// does take a ledger row, a disk reservation and a line on the display for
+    /// work that cannot begin. On a drive of small images the claim loop will
+    /// otherwise spawn a task per file, all at once.
+    pub max_in_flight: usize,
     /// Duration floor for the AV1 tier, in seconds. Zero converts every length.
     pub min_video_secs: f64,
     /// Encoder settings the video recipes need.
@@ -147,6 +155,18 @@ impl<R: Remote + 'static> Pipeline<R> {
                 break;
             }
 
+            // Wait for room before claiming anything, so a file is only taken
+            // out of the ledger when there is somewhere for it to go.
+            while tasks.len() >= opts.max_in_flight {
+                match tasks.join_next().await {
+                    Some(done) => {
+                        summary.merge(done.unwrap_or(Outcome::Failed));
+                        self.show(&summary, started);
+                    }
+                    None => break,
+                }
+            }
+
             let Some(row) = self
                 .ledger
                 .claim_next(opts.scope.prefixes(), opts.order)
@@ -174,8 +194,7 @@ impl<R: Remote + 'static> Pipeline<R> {
             // file lands, which on a long video is a very long time.
             self.show(&summary, started);
 
-            // Keep the in-flight set from growing without bound while the disk
-            // budget is the real limiter; drain whatever has already finished.
+            // Collect anything that finished while this one was being claimed.
             while let Some(done) = tasks.try_join_next() {
                 summary.merge(done.unwrap_or(Outcome::Failed));
                 self.show(&summary, started);

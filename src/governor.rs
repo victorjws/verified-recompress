@@ -115,9 +115,15 @@ pub struct Governor {
     cloud_capacity_mib: u32,
     net: Arc<Semaphore>,
     api: Arc<Semaphore>,
-    cpu: Arc<Semaphore>,
-    cpu_total: usize,
-    non_video_cores: usize,
+    /// Cores video may take. Separate from the pool everything else draws on,
+    /// because one semaphore cannot serve both: tokio hands out permits in
+    /// request order, so a video waiting for fourteen of them takes the twelve
+    /// that are free and holds them idle while every one-core job queues behind
+    /// it. The setting meant to keep image work flowing did the opposite.
+    cpu_video: Arc<Semaphore>,
+    /// Cores reserved for everything that is not video.
+    cpu_other: Arc<Semaphore>,
+    video_cores: usize,
     free_cores: Arc<Mutex<Vec<usize>>>,
 }
 
@@ -125,6 +131,8 @@ impl Governor {
     /// `cloud_free_bytes` is what the remote reports, before the configured safety
     /// margin is subtracted.
     pub fn new(cfg: &Config, cloud_free_bytes: u64) -> Result<Self> {
+        // `resolve` already refuses a reserve that leaves video nothing.
+        let video_cores = cfg.cpu_cores.saturating_sub(cfg.non_video_cores).max(1);
         let cloud_mib = bytes_to_mib(cloud_free_bytes).saturating_sub(cfg.cloud_reserve_mib);
         if cloud_mib == 0 {
             bail!(
@@ -150,9 +158,9 @@ impl Governor {
             cloud_capacity_mib: cloud_mib,
             net: Arc::new(Semaphore::new(cfg.net_concurrency)),
             api: Arc::new(Semaphore::new(cfg.api_concurrency)),
-            cpu: Arc::new(Semaphore::new(cfg.cpu_cores)),
-            cpu_total: cfg.cpu_cores,
-            non_video_cores: cfg.non_video_cores,
+            cpu_video: Arc::new(Semaphore::new(video_cores)),
+            cpu_other: Arc::new(Semaphore::new(cfg.non_video_cores)),
+            video_cores,
             free_cores: Arc::new(Mutex::new((0..cfg.cpu_cores).collect())),
         })
     }
@@ -242,12 +250,17 @@ impl Governor {
     /// stalling on it. Everything else takes a single core.
     pub async fn cpu(&self, recipe: Recipe) -> CpuLease {
         let want = self.cores_for(recipe);
-        let permit = self
-            .cpu
-            .clone()
-            .acquire_many_owned(want as u32)
-            .await
-            .expect("cpu semaphore is never closed");
+        let permit = if holds_source(recipe) {
+            // Video draws only on its own pool, so a large request can never
+            // queue in front of a small one.
+            self.cpu_video
+                .clone()
+                .acquire_many_owned(want as u32)
+                .await
+                .expect("cpu semaphore is never closed")
+        } else {
+            self.one_core().await
+        };
 
         let mut cores = Vec::with_capacity(want);
         if let Ok(mut free) = self.free_cores.lock() {
@@ -265,12 +278,29 @@ impl Governor {
         }
     }
 
+    /// Takes one core for a job that only needs one.
+    ///
+    /// Its own pool first. Failing that it will use an idle video core rather
+    /// than leave one doing nothing — but only if one is free right now, never
+    /// by queueing, because queueing on that pool is what would put it in front
+    /// of a video encode.
+    async fn one_core(&self) -> OwnedSemaphorePermit {
+        if let Ok(permit) = self.cpu_other.clone().try_acquire_owned() {
+            return permit;
+        }
+        if let Ok(permit) = self.cpu_video.clone().try_acquire_owned() {
+            return permit;
+        }
+        self.cpu_other
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("cpu semaphore is never closed")
+    }
+
     fn cores_for(&self, recipe: Recipe) -> usize {
         match recipe {
-            Recipe::Av1 | Recipe::Ffv1 => self
-                .cpu_total
-                .saturating_sub(self.non_video_cores)
-                .max(1),
+            _ if holds_source(recipe) => self.video_cores,
             _ => 1,
         }
     }
@@ -456,6 +486,61 @@ mod tests {
     async fn video_always_gets_at_least_one_core() {
         let g = governor(50, 10, 3, 100);
         assert_eq!(g.cpu(Recipe::Av1).await.cores().len(), 1);
+    }
+
+    /// One semaphore cannot serve both sizes of request. Tokio hands out permits
+    /// in request order, so a video waiting for most of the pool takes what is
+    /// free and holds it idle until the rest arrives, with every one-core job
+    /// queued behind it — the setting meant to keep image work flowing doing the
+    /// exact opposite. Separate pools are what make it true.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_waiting_video_does_not_block_image_work() {
+        // 8 cores, 2 of them reserved, so video gets 6.
+        let g = Arc::new(governor(100, 10, 8, 500));
+
+        // A video takes all six of its cores, so its pool is empty.
+        let hog = g.cpu(Recipe::Av1).await;
+        assert_eq!(hog.cores().len(), 6);
+
+        // A second video queues, which is where the old shared pool would start
+        // swallowing permits an image job needed.
+        let waiting = tokio::spawn({
+            let g = Arc::clone(&g);
+            async move { g.cpu(Recipe::Av1).await }
+        });
+        tokio::task::yield_now().await;
+
+        // The reserved cores are still there for image work.
+        for _ in 0..2 {
+            let lease = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                g.cpu(Recipe::JxlFromJpeg),
+            )
+            .await
+            .expect("an image must not queue behind a video");
+            assert_eq!(lease.cores().len(), 1);
+        }
+
+        waiting.abort();
+    }
+
+    /// With no video running its cores should not sit idle, so a one-core job
+    /// borrows them rather than queueing on its own small pool.
+    #[tokio::test]
+    async fn image_work_uses_idle_video_cores() {
+        let g = governor(100, 10, 8, 500);
+
+        let mut held = Vec::new();
+        for _ in 0..8 {
+            held.push(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    g.cpu(Recipe::JxlFromJpeg),
+                )
+                .await
+                .expect("all eight cores should be reachable when no video wants them"),
+            );
+        }
     }
 
     /// Keeping the original means it is still on disk while the output and any
