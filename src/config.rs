@@ -49,6 +49,7 @@ pub struct FileConfig {
     pub remote: Option<String>,
     pub staging_dir: Option<PathBuf>,
     pub keep_originals: Option<PathBuf>,
+    pub keep_converted: Option<PathBuf>,
     pub staging_budget_gb: Option<u64>,
     pub max_file_gb: Option<u64>,
     pub cloud_reserve_gb: Option<u64>,
@@ -94,6 +95,7 @@ pub struct Overrides {
     pub remote: Option<String>,
     pub staging_dir: Option<PathBuf>,
     pub keep_originals: Option<PathBuf>,
+    pub keep_converted: Option<PathBuf>,
     pub staging_budget_gb: Option<u64>,
     pub max_file_gb: Option<u64>,
     pub cloud_reserve_gb: Option<u64>,
@@ -121,6 +123,9 @@ pub struct Config {
     /// Outside the staging budget: the caller chose the location, and it holds
     /// files past the end of the run that put them there.
     pub keep_originals: Option<PathBuf>,
+    /// Where to leave a copy of each converted file, for comparing against the
+    /// originals without fetching them back. Also outside the budget.
+    pub keep_converted: Option<PathBuf>,
     pub staging_budget_mib: u32,
     pub max_file_mib: u32,
     pub cloud_reserve_mib: u32,
@@ -241,6 +246,22 @@ impl Config {
 
         // 0 is the documented "disabled" sentinel for automatic reclamation.
         let keep_originals = ov.keep_originals.or(file.keep_originals).map(expand_home);
+        let keep_converted = ov.keep_converted.or(file.keep_converted).map(expand_home);
+
+        // A recipe that keeps its container writes the conversion to the path
+        // the original came from — AV1 does — so one directory holding both
+        // would have the converted file land on top of the original it was
+        // meant to be compared against.
+        if let (Some(originals), Some(converted)) = (&keep_originals, &keep_converted)
+            && originals == converted
+        {
+            bail!(
+                "keep_originals and keep_converted are both {}, and a conversion \
+                 that keeps its container would overwrite the original it is \
+                 meant to be compared with. Give them separate directories.",
+                originals.display()
+            );
+        }
         let reclaim_when_low_mib = match ov.reclaim_when_low_gb.or(file.reclaim_when_low_gb) {
             None | Some(0) => None,
             Some(gb) => Some(gb_to_mib(gb, "reclaim_when_low_gb")?),
@@ -308,6 +329,7 @@ impl Config {
                 .unwrap_or_else(|| "filen:".to_string()),
             staging_dir,
             keep_originals,
+            keep_converted,
             staging_budget_mib,
             max_file_mib,
             cloud_reserve_mib,
@@ -360,6 +382,60 @@ mod tests {
 
     fn resolve(file: FileConfig, ov: Overrides, avail: u64) -> Result<Config> {
         Config::resolve(file, ov, avail)
+    }
+
+    /// AV1 keeps the source container, so its output path is the input path.
+    /// One directory holding both copies would have the conversion land on top
+    /// of the original it exists to be compared against.
+    #[test]
+    fn the_two_keep_directories_must_differ() {
+        let err = resolve(
+            FileConfig {
+                keep_originals: Some("/mnt/archive".into()),
+                keep_converted: Some("/mnt/archive".into()),
+                ..Default::default()
+            },
+            Overrides::default(),
+            100 * GB,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("separate directories"), "{err}");
+
+        let cfg = resolve(
+            FileConfig {
+                keep_originals: Some("/mnt/archive/before".into()),
+                keep_converted: Some("/mnt/archive/after".into()),
+                ..Default::default()
+            },
+            Overrides::default(),
+            100 * GB,
+        )
+        .unwrap();
+        assert_eq!(cfg.keep_originals, Some("/mnt/archive/before".into()));
+        assert_eq!(cfg.keep_converted, Some("/mnt/archive/after".into()));
+    }
+
+    /// Either on its own is fine; it is only the pair that can collide.
+    #[test]
+    fn keeping_only_one_side_is_allowed() {
+        for (originals, converted) in [
+            (Some("/mnt/a"), None),
+            (None, Some("/mnt/a")),
+            (None, None),
+        ] {
+            assert!(
+                resolve(
+                    FileConfig {
+                        keep_originals: originals.map(Into::into),
+                        keep_converted: converted.map(Into::into),
+                        ..Default::default()
+                    },
+                    Overrides::default(),
+                    100 * GB,
+                )
+                .is_ok()
+            );
+        }
     }
 
     /// A shell expands `~` before the program sees it, but only sometimes:

@@ -81,6 +81,8 @@ pub struct Options {
     pub order: Order,
     /// Where to leave a copy of each original before its replacement takes over.
     pub keep_originals: Option<std::path::PathBuf>,
+    /// Where to leave a copy of each converted file as well.
+    pub keep_converted: Option<std::path::PathBuf>,
     /// Empty the trash mid-run once remote free space falls below this many MiB.
     pub reclaim_when_low_mib: Option<u32>,
     /// How many files may be in flight at once.
@@ -504,18 +506,25 @@ impl<R: Remote + 'static> Pipeline<R> {
             });
         }
 
-        // Before anything on the remote changes. A failure to keep the original
-        // must not leave a run that has already replaced it, which is the one
-        // outcome this option exists to prevent.
+        let remote_output =
+            swap_extension(&row.path, recipe.output_extension(extension_of(&row.path)));
+
+        // Both copies are taken before anything on the remote changes, so a
+        // failure to write either stops the run with the original still in
+        // place. That is the one outcome keeping them exists to prevent.
+        if let Some(dir) = &opts.keep_converted {
+            slot.stage("keeping the converted file");
+            // Copied, not moved: the upload still needs it.
+            copy_out(&output, dir, &remote_output)
+                .await
+                .with_context(|| format!("could not keep the conversion of {}", row.path))?;
+        }
         if let Some(dir) = &opts.keep_originals {
             slot.stage("keeping the original");
             keep_original(&input, dir, &row.path)
                 .await
                 .with_context(|| format!("could not keep a copy of {}", row.path))?;
         }
-
-        let remote_output =
-            swap_extension(&row.path, recipe.output_extension(extension_of(&row.path)));
 
         // A recipe that keeps the container produces the same path it started
         // from. Uploading straight over it and then deleting "the original" would
@@ -728,12 +737,10 @@ fn swap_extension(path: &str, new_extension: &str) -> String {
 /// finished with by this point, and a rename costs nothing. Across filesystems
 /// there is no choice but to copy.
 async fn keep_original(input: &Path, dir: &Path, remote_path: &str) -> Result<()> {
-    let target = dir.join(safe_relative(remote_path)?);
-    if let Some(parent) = target.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
+    let target = prepare_target(dir, remote_path).await?;
+    // Moved where the filesystem allows it: the staging copy is finished with by
+    // this point, and a rename costs nothing. Across filesystems there is no
+    // choice but to copy.
     if tokio::fs::rename(input, &target).await.is_ok() {
         return Ok(());
     }
@@ -741,6 +748,28 @@ async fn keep_original(input: &Path, dir: &Path, remote_path: &str) -> Result<()
         .await
         .with_context(|| format!("failed to write {}", target.display()))?;
     Ok(())
+}
+
+/// Leaves a copy of `file` under `dir`, keeping its remote path.
+///
+/// Always a copy: the conversion still has to be uploaded from where it is.
+async fn copy_out(file: &Path, dir: &Path, remote_path: &str) -> Result<()> {
+    let target = prepare_target(dir, remote_path).await?;
+    tokio::fs::copy(file, &target)
+        .await
+        .with_context(|| format!("failed to write {}", target.display()))?;
+    Ok(())
+}
+
+/// Resolves where a remote path lands under `dir` and makes room for it.
+async fn prepare_target(dir: &Path, remote_path: &str) -> Result<std::path::PathBuf> {
+    let target = dir.join(safe_relative(remote_path)?);
+    if let Some(parent) = target.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    Ok(target)
 }
 
 /// Reduces a remote path to something that can only land under the directory it

@@ -123,6 +123,12 @@ pub struct RunArgs {
     #[arg(long, value_name = "DIR")]
     pub keep_originals: Option<PathBuf>,
 
+    /// Keep a copy of each converted file here as well, to compare against the
+    /// originals without fetching them back. Not counted against the staging
+    /// budget, and must differ from --keep-originals.
+    #[arg(long, value_name = "DIR")]
+    pub keep_converted: Option<PathBuf>,
+
     /// Local staging budget in GB.
     #[arg(long, value_name = "GB")]
     pub budget_gb: Option<u64>,
@@ -198,6 +204,7 @@ impl Cli {
         if let Command::Run(args) = &self.command {
             ov.staging_dir = args.staging_dir.clone();
             ov.keep_originals = args.keep_originals.clone();
+            ov.keep_converted = args.keep_converted.clone();
             ov.staging_budget_gb = args.budget_gb;
             ov.max_file_gb = args.max_file_gb;
             ov.cloud_reserve_gb = args.cloud_reserve_gb;

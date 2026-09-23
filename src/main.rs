@@ -245,6 +245,14 @@ async fn run_convert(cfg: &Config, args: &RunArgs) -> Result<()> {
         .context("the remote did not report free space, so uploads cannot be budgeted")?;
     let governor = Arc::new(Governor::new(cfg, free)?);
 
+    if let Some(dir) = &cfg.keep_converted
+        && args.execute
+    {
+        tracing::info!(
+            "keeping converted files under {} (outside the staging budget)",
+            dir.display()
+        );
+    }
     if let Some(dir) = &cfg.keep_originals {
         if args.execute {
             tracing::info!(
@@ -319,6 +327,7 @@ async fn run_convert(cfg: &Config, args: &RunArgs) -> Result<()> {
             // Only on a real run: a dry run leaves the remote original where it
             // is, so there is nothing to preserve it from.
             keep_originals: args.execute.then(|| cfg.keep_originals.clone()).flatten(),
+            keep_converted: args.execute.then(|| cfg.keep_converted.clone()).flatten(),
             // Dry runs replace nothing, so there is nothing billed to reclaim.
             reclaim_when_low_mib: args.execute.then_some(cfg.reclaim_when_low_mib).flatten(),
             // One job per core keeps the encoders fed; the network slots on top

@@ -254,6 +254,7 @@ nothing to the remote.
 | `--limit N` | stop after N files |
 | `--staging-dir DIR` | local scratch directory |
 | `--keep-originals DIR` | leave a copy of each original here before its replacement takes over |
+| `--keep-converted DIR` | leave a copy of each converted file here too, to compare against the originals |
 | `--reclaim-when-low-gb GB` | empty the trash mid-run once remote free space falls below this. Requires `--keep-originals` |
 | `--budget-gb GB` | local staging budget (default: 70% of free space) |
 | `--max-file-gb GB` | skip files whose staging reservation exceeds this (default: half the budget) |
@@ -285,8 +286,21 @@ The copy is taken after the conversion has proven itself and before anything on 
 remote changes, so a failure to write it stops the run with the original still in
 place. A dry run keeps nothing, because it replaces nothing.
 
-A leading `~` is expanded, so it works from the config file and from a quoted
-argument, where the shell leaves it alone.
+`--keep-converted DIR` does the same for the results, so both sides of every
+conversion are on hand to compare without fetching anything back. Each mirrors the
+remote path, so the two directories line up file for file:
+
+```
+before/Photos/2019/shot.jpg        after/Photos/2019/shot.jxl
+before/Photos/2019/sub/a.jpg       after/Photos/2019/sub/a.jxl
+```
+
+They have to be separate directories. AV1 keeps the source container, so its
+output path *is* the input path, and one directory holding both would have the
+conversion land on top of the original it exists to be compared against.
+
+A leading `~` is expanded in both, so they work from the config file and from a
+quoted argument, where the shell leaves it alone.
 
 `DIR` is **not** counted against the staging budget — you chose where it goes, and
 it holds files past the end of the run that put them there. The budget does account
@@ -403,6 +417,7 @@ purge_after_days = 30
 | `remote` | `filen:` | any rclone remote |
 | `staging_dir` | `$TMPDIR/verified-recompress` | see below |
 | `keep_originals` | disabled | where to leave each original. Not counted against the staging budget |
+| `keep_converted` | disabled | where to leave each converted file. Must differ from `keep_originals` |
 | `staging_budget_gb` | 70% of free space | rejected if larger than what is actually free |
 | `max_file_gb` | half the budget | files needing more are skipped as `too_large_for_budget` |
 | `cloud_reserve_gb` | 5 | remote headroom kept free |
@@ -429,7 +444,8 @@ survive a reboot:
 
 ```toml
 staging_dir = "/var/lib/verified-recompress"
-# keep_originals = "/mnt/archive/originals"
+# keep_originals = "/mnt/archive/before"
+# keep_converted = "/mnt/archive/after"
 ```
 
 Local staging directories left behind by an interrupted run are swept at the start of the next
@@ -489,7 +505,7 @@ Other things worth knowing:
 ## Development
 
 ```sh
-cargo test          # 357 tests
+cargo test          # 359 tests
 cargo build --release
 ```
 
