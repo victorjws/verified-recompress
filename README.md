@@ -443,7 +443,7 @@ Other things worth knowing:
 ## Development
 
 ```sh
-cargo test          # 339 tests
+cargo test          # 340 tests
 cargo build --release
 ```
 

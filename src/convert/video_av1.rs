@@ -148,16 +148,23 @@ pub async fn search_crf(input: &Path, settings: &Settings, cores: &[usize]) -> R
 
 /// Pulls the chosen CRF out of ab-av1's report.
 ///
-/// ab-av1 searches a continuous scale and reports fractions: "crf 34.25 VMAF
-/// 97.12 ...". SVT-AV1 takes whole numbers, so the answer is rounded down —
-/// towards higher quality, since a lower CRF is the safer side of a gate the
-/// full encode still has to clear on its own.
+/// ab-av1 bisects a continuous scale, so it reports halves and quarters —
+/// "crf 34.25", "crf 37.5" — even though `--crf-increment` defaults to 1.0 for
+/// SVT-AV1. ffmpeg's `-crf` is an integer option and accepts the fraction
+/// anyway, rounding it half-to-even rather than rejecting it. So the sample
+/// ab-av1 says it measured at 34.75 was really encoded at 35.
+///
+/// Rounding the same way is what makes the parsed value the one that was
+/// actually proven, rather than a neighbour that merely looks close.
+/// Verified against ffmpeg 9.0.1 and SVT-AV1 4.2.0: 34.25 and 34.5 both encode
+/// identically to 34, while 34.75 and 35.5 match 35 and 36.
 fn parse_crf(text: &str) -> Option<u8> {
     text.lines()
         .filter_map(|line| {
             let rest = line.trim().strip_prefix("crf ")?;
             let value: f64 = rest.split_whitespace().next()?.parse().ok()?;
-            (value.is_finite() && value >= 0.0).then(|| value.floor().min(63.0) as u8)
+            (value.is_finite() && value >= 0.0)
+                .then(|| value.round_ties_even().min(63.0) as u8)
         })
         .next_back()
 }
@@ -281,12 +288,33 @@ mod tests {
     /// every AV1 conversion quietly fell back to a fixed CRF, having paid for
     /// the search anyway.
     #[test]
-    fn a_fractional_crf_is_read_and_rounded_towards_quality() {
+    fn a_fractional_crf_is_read_the_way_ffmpeg_reads_it() {
         let report = "\
 [INFO ab_av1::command::sample_encode] crf 37.5 VMAF 96.24 predicted video stream size 4.38 MiB (45%)
 [INFO ab_av1::command::crf_search] crf 37.5 VMAF 96.24 (45%)
 crf 34.25 VMAF 97.12 predicted video stream size 5.98 MiB (61%) taking 12 seconds";
-        assert_eq!(parse_crf(report), Some(34), "34.25 rounds down, not up");
+        assert_eq!(parse_crf(report), Some(34));
+    }
+
+    /// ffmpeg rounds a fractional `-crf` half-to-even rather than rejecting it,
+    /// so ab-av1's samples were encoded at the rounded value all along. Matching
+    /// that is what makes the parsed CRF the one ab-av1 actually proved.
+    /// Each of these was checked against a real encode.
+    #[test]
+    fn rounding_matches_what_the_encoder_did() {
+        for (reported, encoded) in [
+            (34.25, 34),
+            (34.5, 34),
+            (34.75, 35),
+            (35.5, 36),
+            (37.5, 38),
+        ] {
+            assert_eq!(
+                parse_crf(&format!("crf {reported} VMAF 96.0")),
+                Some(encoded),
+                "{reported} is encoded as {encoded}"
+            );
+        }
     }
 
     #[test]
