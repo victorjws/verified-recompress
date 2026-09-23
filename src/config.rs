@@ -138,6 +138,26 @@ pub struct Config {
     pub purge_after_days: u32,
 }
 
+/// Expands a leading `~` to the home directory.
+///
+/// A shell does this before the program sees it, but only sometimes: quoted
+/// arguments and anything written in the config file arrive with the tilde
+/// intact. Joined to a path it then becomes a directory literally named `~`
+/// under the working directory — created without complaint, so the only symptom
+/// is that the files are not where they were asked for.
+///
+/// `~user` is left alone: resolving another account's home is not portable, and
+/// a silent wrong answer is worse than the path as written.
+pub fn expand_home(path: PathBuf) -> PathBuf {
+    let Ok(rest) = path.strip_prefix("~") else {
+        return path;
+    };
+    match dirs::home_dir() {
+        Some(home) => home.join(rest),
+        None => path,
+    }
+}
+
 fn gb_to_mib(gb: u64, field: &str) -> Result<u32> {
     let mib = gb
         .checked_mul(1024)
@@ -151,10 +171,11 @@ impl Config {
     /// `available_bytes` is the free space on the staging filesystem, passed in
     /// rather than probed so this stays a pure function and can be unit tested.
     pub fn resolve(file: FileConfig, ov: Overrides, available_bytes: u64) -> Result<Self> {
-        let staging_dir = ov
-            .staging_dir
-            .or(file.staging_dir)
-            .unwrap_or_else(default_staging_dir);
+        let staging_dir = expand_home(
+            ov.staging_dir
+                .or(file.staging_dir)
+                .unwrap_or_else(default_staging_dir),
+        );
 
         let min_video_secs = ov
             .min_video_secs
@@ -219,7 +240,7 @@ impl Config {
         )?;
 
         // 0 is the documented "disabled" sentinel for automatic reclamation.
-        let keep_originals = ov.keep_originals.or(file.keep_originals);
+        let keep_originals = ov.keep_originals.or(file.keep_originals).map(expand_home);
         let reclaim_when_low_mib = match ov.reclaim_when_low_gb.or(file.reclaim_when_low_gb) {
             None | Some(0) => None,
             Some(gb) => Some(gb_to_mib(gb, "reclaim_when_low_gb")?),
@@ -339,6 +360,63 @@ mod tests {
 
     fn resolve(file: FileConfig, ov: Overrides, avail: u64) -> Result<Config> {
         Config::resolve(file, ov, avail)
+    }
+
+    /// A shell expands `~` before the program sees it, but only sometimes:
+    /// quoted arguments and anything in the config file arrive with the tilde
+    /// intact. Joined to a path it becomes a directory literally named `~` under
+    /// the working directory, created without complaint, so the only symptom is
+    /// that the files are not where they were asked for.
+    #[test]
+    fn a_leading_tilde_becomes_the_home_directory() {
+        let home = dirs::home_dir().expect("a home directory to test against");
+
+        assert_eq!(expand_home(PathBuf::from("~/archive")), home.join("archive"));
+        assert_eq!(expand_home(PathBuf::from("~")), home);
+        assert_eq!(
+            expand_home(PathBuf::from("~/a/b/c")),
+            home.join("a").join("b").join("c")
+        );
+
+        // Absolute and relative paths are untouched.
+        assert_eq!(
+            expand_home(PathBuf::from("/mnt/archive")),
+            PathBuf::from("/mnt/archive")
+        );
+        assert_eq!(
+            expand_home(PathBuf::from("archive")),
+            PathBuf::from("archive")
+        );
+        // Only a leading one, and only its own component: a directory whose name
+        // merely starts with a tilde is a directory.
+        assert_eq!(
+            expand_home(PathBuf::from("/tmp/~/x")),
+            PathBuf::from("/tmp/~/x")
+        );
+        assert_eq!(
+            expand_home(PathBuf::from("~backup/x")),
+            PathBuf::from("~backup/x"),
+            "another account's home is not something we can resolve"
+        );
+    }
+
+    /// The two path settings a run writes through both have to expand, and the
+    /// config file is where a tilde is most likely to survive.
+    #[test]
+    fn path_settings_expand_the_tilde() {
+        let home = dirs::home_dir().unwrap();
+        let cfg = resolve(
+            FileConfig {
+                staging_dir: Some("~/scratch".into()),
+                keep_originals: Some("~/archive".into()),
+                ..Default::default()
+            },
+            Overrides::default(),
+            100 * GB,
+        )
+        .unwrap();
+        assert_eq!(cfg.staging_dir, home.join("scratch"));
+        assert_eq!(cfg.keep_originals, Some(home.join("archive")));
     }
 
     /// Emptying the trash mid-run destroys the remote way back — not even the

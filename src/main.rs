@@ -52,6 +52,7 @@ async fn main() -> Result<()> {
     let config_path = cli
         .config
         .clone()
+        .map(config::expand_home)
         .or_else(FileConfig::default_path)
         .context("could not determine a config file location")?;
     let file = FileConfig::load(&config_path)?;

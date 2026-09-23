@@ -285,6 +285,9 @@ The copy is taken after the conversion has proven itself and before anything on 
 remote changes, so a failure to write it stops the run with the original still in
 place. A dry run keeps nothing, because it replaces nothing.
 
+A leading `~` is expanded, so it works from the config file and from a quoted
+argument, where the shell leaves it alone.
+
 `DIR` is **not** counted against the staging budget — you chose where it goes, and
 it holds files past the end of the run that put them there. The budget does account
 for the original staying on disk longer than it otherwise would: recipes that
@@ -486,7 +489,7 @@ Other things worth knowing:
 ## Development
 
 ```sh
-cargo test          # 355 tests
+cargo test          # 357 tests
 cargo build --release
 ```
 
