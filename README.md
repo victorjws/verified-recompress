@@ -142,7 +142,7 @@ Global flags work with every subcommand:
 | --- | --- |
 | `--config FILE` | config file path (default `~/.config/verified-recompress/config.toml`) |
 | `--remote REMOTE` | rclone remote, e.g. `filen:` (default `filen:`) |
-| `--path PATH` | scope to a remote path. Repeatable. Replaces `paths` from the config file |
+| `--path PATH` | scope to a remote path. Repeatable. Replaces `paths` from the config file. Honoured by `scan`, `plan`, `run`, `bench`, `dedup` and `verify`; `report` is always drive-wide |
 | `--exclude GLOB` | exclude a glob. Repeatable. Added to `exclude` from the config file |
 | `-v`, `-vv` | raise log verbosity. `RUST_LOG` overrides it |
 
@@ -206,7 +206,8 @@ original once the picture has visibly degraded. JXL does beat WebP by roughly 23
 ### `plan`
 
 Assigns a recipe to every pending file and reports projected savings, grouped by recipe and by
-skip reason. Read-only.
+skip reason. Read-only. `--path` scopes it, and prefixes stop at path segments, so `--path photos`
+does not take `photos-backup` with it.
 
 The projection uses conservative per-recipe ratios, not measurements, and says so. Video mostly
 lands in `needs_probe`: judging a video means running ffprobe on it, and that means downloading
@@ -508,7 +509,7 @@ Other things worth knowing:
 ## Development
 
 ```sh
-cargo test          # 360 tests
+cargo test          # 361 tests
 cargo build --release
 ```
 

@@ -177,9 +177,14 @@ async fn run_scan(cfg: &Config, hash: bool) -> Result<()> {
 /// "needs a probe" rather than a guess: probing a remote file means fetching it.
 async fn run_plan(cfg: &Config) -> Result<()> {
     let ledger = Ledger::open(&cfg.staging_dir.join("ledger.sqlite"))?;
-    let rows = ledger.list_by_state(State::Pending).await?;
+    let scope = Scope::new(&cfg.paths, &cfg.exclude)?;
+    let mut rows = ledger.list_by_state(State::Pending).await?;
+    // `--path` is a global flag, and a projection for one folder is the most
+    // natural thing to ask for. Ignoring it here answered a question nobody
+    // asked, drive-wide.
+    rows.retain(|row| scope.allows(&row.path));
     if rows.is_empty() {
-        emit!("No pending files. Run `scan` first.");
+        emit!("No pending files in scope. Run `scan` first.");
         return Ok(());
     }
 
@@ -591,9 +596,17 @@ async fn run_dedup(cfg: &Config) -> Result<()> {
 /// present and the right size, and says so rather than implying more.
 async fn run_verify(cfg: &Config, sample: Option<usize>) -> Result<()> {
     let ledger = Ledger::open(&cfg.staging_dir.join("ledger.sqlite"))?;
-    let records = ledger.completed(sample).await?;
+    let scope = Scope::new(&cfg.paths, &cfg.exclude)?;
+    // Scoped before the sample is taken, so `--sample 5 --path X` checks five
+    // conversions under X rather than whatever five of the drive happened to
+    // fall in it.
+    let mut records = ledger.completed(None).await?;
+    records.retain(|record| scope.allows(&record.path));
+    if let Some(n) = sample {
+        records.truncate(n);
+    }
     if records.is_empty() {
-        emit!("No completed conversions to verify.");
+        emit!("No completed conversions to verify in scope.");
         return Ok(());
     }
 

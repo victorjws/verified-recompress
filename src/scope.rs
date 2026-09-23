@@ -106,6 +106,18 @@ mod tests {
     /// This is the bug that made scoping meaningless in practice: a run scoped to
     /// one folder must not reach into a sibling.
     #[test]
+    fn a_prefix_stops_at_a_path_segment() {
+        // The reason `plan --path photos` reports two files and not three: a
+        // prefix that matched by characters would take photos-backup with it.
+        let scope = scope(&["photos"], &[]);
+        assert!(scope.allows("photos/a.jpg"));
+        assert!(scope.allows("photos/2019/b.jpg"));
+        assert!(!scope.allows("photos-backup/c.jpg"));
+        assert!(!scope.allows("photosomething.jpg"));
+        assert!(!scope.allows("music/d.jpg"));
+    }
+
+    #[test]
     fn a_sibling_folder_is_out_of_scope() {
         let s = scope(&["/photos"], &[]);
         assert!(s.allows("photos/shot.jpg"));
