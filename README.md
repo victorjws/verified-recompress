@@ -310,6 +310,24 @@ for the original staying on disk longer than it otherwise would: recipes that
 normally drop their source before verification reserve one extra copy while this is
 on.
 
+#### Interrupting a run
+
+The first Ctrl-C stops new files being claimed. A second one exits immediately,
+and `kill -9` does the same more abruptly — in every case the remote is left
+consistent, because a replacement is only uploaded once it verifies and an
+original is only removed once its replacement is confirmed.
+
+What differs is what the ledger is left holding. A terminal sends its signal to
+the whole foreground process group, so Ctrl-C also kills the encoders and every
+job in flight surfaces as an error. Those are recorded as interrupted and put
+back at pending, not as failures — a run you stopped should not need
+`--retry-failed` to undo. A `kill -9` leaves rows at `claimed` instead, which the
+next run recovers the same way.
+
+`kill -9` from another terminal reaches only the parent, so the encoders it had
+running are orphaned and keep going. `kill -9 -<pid>` — note the minus — signals
+the whole group.
+
 #### When files fail
 
 A failure records the error against the file and leaves it at `failed`. They are
@@ -535,7 +553,7 @@ Other things worth knowing:
 ## Development
 
 ```sh
-cargo test          # 363 tests
+cargo test          # 364 tests
 cargo build --release
 ```
 

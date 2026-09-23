@@ -372,7 +372,18 @@ async fn run_convert(cfg: &Config, args: &RunArgs) -> Result<()> {
             summary.saved_bytes() as f64 / summary.input_bytes as f64 * 100.0
         },
     );
-    emit!("  skipped {}  failed {}", summary.skipped, summary.failed);
+    emit!(
+        "  skipped {}  failed {}",
+        progress::thousands(summary.skipped),
+        progress::thousands(summary.failed)
+    );
+    if summary.cancelled > 0 {
+        emit!(
+            "  {} file(s) were interrupted and are back at pending; nothing was \
+             left half-done.",
+            progress::thousands(summary.cancelled)
+        );
+    }
 
     if args.execute && trash::purges_after_run(cfg.trash_policy) {
         tracing::info!("\nEmptying the trash as configured (trash_policy = purge_now)...");

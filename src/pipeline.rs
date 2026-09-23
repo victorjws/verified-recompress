@@ -40,6 +40,8 @@ pub struct Summary {
     pub converted: u64,
     pub skipped: u64,
     pub failed: u64,
+    /// Files an interruption stopped. Back at pending, nothing to undo.
+    pub cancelled: u64,
     pub input_bytes: u64,
     pub output_bytes: u64,
 }
@@ -58,6 +60,7 @@ impl Summary {
             }
             Outcome::Skipped => self.skipped += 1,
             Outcome::Failed => self.failed += 1,
+            Outcome::Cancelled => self.cancelled += 1,
         }
     }
 }
@@ -66,6 +69,10 @@ enum Outcome {
     Converted { input: u64, output: u64 },
     Skipped,
     Failed,
+    /// Stopped by an interruption rather than by anything about the file. Back
+    /// at pending, and counted apart from failures so a stopped run does not
+    /// read as a broken one.
+    Cancelled,
 }
 
 pub struct Options {
@@ -303,6 +310,20 @@ impl<R: Remote + 'static> Pipeline<R> {
         let path = row.path.clone();
         match self.try_process(&row, opts).await {
             Ok(outcome) => outcome,
+            // An interruption is not a failure. A terminal sends its signal to
+            // the whole foreground process group, so Ctrl-C kills the encoders
+            // outright and every job in flight surfaces as an error — recording
+            // those would leave a run the user stopped looking like a run that
+            // went wrong, needing `--retry-failed` to undo.
+            //
+            // Nothing on the remote has changed at this point: a replacement is
+            // only uploaded once it has been verified, and the original is only
+            // removed once the replacement is confirmed.
+            Err(_) if self.cancel.is_cancelled() => {
+                tracing::debug!("{path}: interrupted, returned to pending");
+                let _ = self.ledger.set_state(&path, State::Pending, None).await;
+                Outcome::Cancelled
+            }
             Err(e) => {
                 tracing::warn!("{path}: {e:#}");
                 let _ = self
@@ -874,6 +895,23 @@ async fn read_head(path: &std::path::Path) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A terminal sends its signal to the whole foreground process group, so
+    /// Ctrl-C kills the encoders outright and every job in flight comes back as
+    /// an error. Recording those would leave a run the user stopped looking like
+    /// a run that went wrong, needing `--retry-failed` to undo.
+    #[test]
+    fn an_interruption_is_counted_apart_from_a_failure() {
+        let mut summary = Summary::default();
+        summary.merge(Outcome::Cancelled);
+        summary.merge(Outcome::Cancelled);
+        summary.merge(Outcome::Failed);
+
+        assert_eq!(summary.cancelled, 2);
+        assert_eq!(summary.failed, 1, "a real failure still counts as one");
+        assert_eq!(summary.converted, 0);
+        assert_eq!(summary.skipped, 0);
+    }
 
     /// "Already optimal" and "converted, but did not shrink" are opposite
     /// answers to why a file was left alone — one never fetched it, the other
