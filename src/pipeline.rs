@@ -102,6 +102,8 @@ pub struct Options {
     pub max_in_flight: usize,
     /// Duration floor for the AV1 tier, in seconds. Zero converts every length.
     pub min_video_secs: f64,
+    /// cjxl effort for the raster JXL recipes. The JPEG transcode is fixed.
+    pub raster_effort: u8,
     /// Encoder settings the video recipes need.
     pub video: convert::VideoOptions,
 }
@@ -483,6 +485,7 @@ impl<R: Remote + 'static> Pipeline<R> {
                     &output,
                     workspace.path(),
                     cpu.cores(),
+                    opts.raster_effort,
                     opts.video,
                 )
                 .await?;

@@ -66,6 +66,7 @@ pub struct FileConfig {
     pub non_video_cores: Option<usize>,
     pub order: Option<Order>,
     pub min_video_secs: Option<f64>,
+    pub raster_effort: Option<u8>,
     pub paths: Option<Vec<String>>,
     pub exclude: Option<Vec<String>>,
     pub trash_policy: Option<TrashPolicy>,
@@ -106,6 +107,7 @@ pub struct Overrides {
     pub non_video_cores: Option<usize>,
     pub order: Option<Order>,
     pub min_video_secs: Option<f64>,
+    pub raster_effort: Option<u8>,
     /// Replaces the file's `paths` entirely when non-empty.
     pub paths: Vec<String>,
     /// Appended to the file's `exclude`.
@@ -137,6 +139,9 @@ pub struct Config {
     pub order: Order,
     /// Duration floor for the AV1 tier, in seconds. Zero means no floor.
     pub min_video_secs: f64,
+    /// cjxl effort for PNG, GIF, BMP, TIFF and lossless WebP. The JPEG transcode
+    /// is fixed at the ceiling and has no setting.
+    pub raster_effort: u8,
     pub paths: Vec<String>,
     pub exclude: Vec<String>,
     pub trash_policy: TrashPolicy,
@@ -188,6 +193,17 @@ impl Config {
             .unwrap_or(DEFAULT_MIN_VIDEO_SECS);
         if !min_video_secs.is_finite() || min_video_secs < 0.0 {
             bail!("min_video_secs = {min_video_secs} must be zero or a positive number of seconds");
+        }
+
+        // Checked here as well as by clap, because a value from the config file
+        // never passes through clap at all. Out of range, cjxl would reject it
+        // once per image, turning a typo into a run of identical failures.
+        let raster_effort = ov
+            .raster_effort
+            .or(file.raster_effort)
+            .unwrap_or(crate::convert::jxl::DEFAULT_RASTER_EFFORT);
+        if !(1..=10).contains(&raster_effort) {
+            bail!("raster_effort = {raster_effort} must be between 1 and 10");
         }
 
         let budget_gb = ov.staging_budget_gb.or(file.staging_budget_gb);
@@ -340,6 +356,7 @@ impl Config {
             non_video_cores,
             order: ov.order.or(file.order).unwrap_or(Order::Savings),
             min_video_secs,
+            raster_effort,
             paths,
             exclude,
             trash_policy: ov
@@ -548,6 +565,41 @@ mod tests {
                 "{bad} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn raster_effort_defaults_to_the_conservative_setting() {
+        let cfg = resolve(FileConfig::default(), Overrides::default(), 100 * GB).unwrap();
+        assert_eq!(cfg.raster_effort, crate::convert::jxl::DEFAULT_RASTER_EFFORT);
+    }
+
+    #[test]
+    fn a_raster_effort_outside_the_encoder_range_is_rejected() {
+        // clap guards the flag, but a config file reaches `resolve` directly, and
+        // an unusable value must fail here rather than once per image in cjxl.
+        for bad in [0, 11, 255] {
+            let file = FileConfig {
+                raster_effort: Some(bad),
+                ..Default::default()
+            };
+            assert!(
+                resolve(file, Overrides::default(), 100 * GB).is_err(),
+                "raster_effort = {bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn a_raster_effort_flag_beats_the_config_file() {
+        let file = FileConfig {
+            raster_effort: Some(7),
+            ..Default::default()
+        };
+        let ov = Overrides {
+            raster_effort: Some(10),
+            ..Default::default()
+        };
+        assert_eq!(resolve(file, ov, 100 * GB).unwrap().raster_effort, 10);
     }
 
     #[test]

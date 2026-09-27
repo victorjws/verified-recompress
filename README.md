@@ -268,6 +268,7 @@ nothing to the remote.
 | `--non-video-cores N` | cores video encoding may not take, so image and audio jobs keep flowing (default 2) |
 | `--order savings\|size\|path` | order files are picked up in (default `savings`) |
 | `--min-video-secs SECONDS` | leave videos shorter than this alone (default `0`, meaning convert every length) |
+| `--raster-effort N` | cjxl effort for PNG, GIF, BMP, TIFF and lossless WebP, 1-10 (default 9). See below |
 | `--preset N` | SVT-AV1 preset. Lower is smaller and slower |
 | `--no-temporal-filtering` | turn off SVT-AV1 temporal filtering. Costs 4-8% BD-rate, reduces oversmoothing |
 | `--allow-discard-corrupt` | let ffmpeg drop corrupt MPEG-TS packets. **This makes the remux lossy** |
@@ -276,6 +277,34 @@ nothing to the remote.
 
 Work is scheduled per file with separate semaphores for disk, network, CPU and API calls, so a job
 waiting for a core does not hold a network slot.
+
+#### Choosing the raster effort
+
+`--raster-effort` is the one encoder setting worth tuning for images, and the right value is a
+property of your drive rather than of the format, so it is left to you.
+
+Effort 10 is between 4% and 45% smaller than 9 and between 10x and 18x slower, but the two are not
+related. Measured at a fixed 1280x720, purely by varying what the image holds:
+
+| Content | effort 9 | effort 10 | smaller by |
+| --- | --- | --- | --- |
+| Cellular-automaton noise | 0.29s | 1.50s | 0.2% |
+| Colour bars | 0.17s | 2.71s | 26.9% |
+| Flat colour field | 0.41s | 3.60s | 80.4% |
+| Photographic detail | 0.39s | 6.20s | 10.3% |
+| Detailed fractal | 0.95s | 14.47s | 4.1% |
+
+A fractal spends 14 seconds to save 4%; a flat field spends 4 seconds to save 80%. Within one
+image the cost does scale with pixel count, at a steady 7-9 seconds per megapixel, but nothing
+you can see before encoding says which kind of image a file is.
+
+So measure rather than guess. Run a narrow `--path` at the default, watch the per-file times, and
+if a higher effort is worth trying, raise it and watch again. A run that turns out too slow can be
+interrupted with Ctrl-C and restarted at a lower effort; files already converted are not redone.
+
+JPEG has no such flag. Its transcode repacks the existing DCT coefficients rather than searching
+for an encoding, so effort has nothing to act on: 10 lands within 20 bytes of 9 on real files. It
+is always run at 10.
 
 #### Keeping the originals
 
@@ -451,6 +480,7 @@ cpu_cores = 0
 non_video_cores = 2
 order = "savings"
 min_video_secs = 0
+raster_effort = 9
 paths = ["/Photos/2019", "/Camera"]
 exclude = ["**/.thumbnails/**"]
 trash_policy = "keep"
@@ -473,6 +503,7 @@ purge_after_days = 30
 | `non_video_cores` | 2 | cores video may **not** take. Must be less than `cpu_cores`. Was `video_reserve_cores`, which read as the opposite and still loads |
 | `order` | `savings` | `savings`, `size`, or `path`. `savings` ranks by projected saving, so a small file with a good ratio outranks a large one that converts poorly |
 | `min_video_secs` | `0` | duration floor for the AV1 tier. `0` converts every length |
+| `raster_effort` | `9` | cjxl effort for the raster image recipes, 1-10. JPEG has no equivalent key |
 | `paths` | whole remote | CLI `--path` replaces this list entirely |
 | `exclude` | none | CLI `--exclude` is appended to this list |
 | `trash_policy` | `keep` | `keep`, `purge_after_days`, or `purge_now` |

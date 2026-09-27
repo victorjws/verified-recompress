@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use verified_recompress::classify;
+use verified_recompress::convert::jxl::DEFAULT_RASTER_EFFORT;
 use verified_recompress::convert::{self, Fidelity, VideoOptions};
 use verified_recompress::convert::video_av1;
 use verified_recompress::convert::video_lossless::{self, StreamDigest};
@@ -95,7 +96,15 @@ async fn transport_stream_remux_is_a_true_stream_copy() {
 
     let output = work.path("out.mp4");
     let fp = convert::fingerprint(Recipe::TsRemux, &ts).await.unwrap();
-    convert::encode(Recipe::TsRemux, &ts, &output, work.dir.path(), &[], VideoOptions::default())
+    convert::encode(
+        Recipe::TsRemux,
+        &ts,
+        &output,
+        work.dir.path(),
+        &[],
+        DEFAULT_RASTER_EFFORT,
+        VideoOptions::default(),
+    )
         .await
         .unwrap();
 
@@ -173,7 +182,15 @@ async fn ffv1_preserves_every_frame() {
 
     let output = work.path("out.mkv");
     let fp = convert::fingerprint(Recipe::Ffv1, &source).await.unwrap();
-    convert::encode(Recipe::Ffv1, &source, &output, work.dir.path(), &[], VideoOptions::default())
+    convert::encode(
+        Recipe::Ffv1,
+        &source,
+        &output,
+        work.dir.path(),
+        &[],
+        DEFAULT_RASTER_EFFORT,
+        VideoOptions::default(),
+    )
         .await
         .unwrap();
 

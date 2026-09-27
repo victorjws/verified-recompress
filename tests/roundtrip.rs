@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use verified_recompress::convert::jxl::DEFAULT_RASTER_EFFORT;
 use verified_recompress::convert::{self, Fidelity};
 use verified_recompress::policy::Recipe;
 
@@ -65,9 +66,17 @@ fn size(path: &Path) -> u64 {
 async fn round_trip(recipe: Recipe, input: &Path, work: &Work, out_name: &str) -> (Fidelity, u64, u64) {
     let output = work.path(out_name);
     let fp = convert::fingerprint(recipe, input).await.unwrap();
-    convert::encode(recipe, input, &output, work.dir.path(), &[], Default::default())
-        .await
-        .unwrap();
+    convert::encode(
+        recipe,
+        input,
+        &output,
+        work.dir.path(),
+        &[],
+        DEFAULT_RASTER_EFFORT,
+        Default::default(),
+    )
+    .await
+    .unwrap();
     let fidelity = convert::verify(recipe, &output, &fp, work.dir.path(), &[])
         .await
         .unwrap();
@@ -140,6 +149,48 @@ async fn png_round_trips_pixel_identically_and_shrinks() {
 
     assert_eq!(fidelity, Fidelity::ContentExact);
     assert!(after < before, "{after} should be smaller than {before}");
+}
+
+/// The effort setting has to survive the whole way down to cjxl's command line,
+/// and a value that quietly went nowhere would look exactly like one that worked:
+/// the conversion still succeeds and still verifies. What it would not do is
+/// change the output, so that is what this checks.
+///
+/// Effort 1 against 9, because the gap is unambiguous. It is deliberately not an
+/// assertion that more effort is always smaller — measured on a gradient, 9 beats
+/// 10 — so the claim here is only that the number reaches the encoder.
+#[tokio::test]
+async fn the_raster_effort_setting_reaches_the_encoder() {
+    require!("ffmpeg" => "-version", "cjxl" => "--version");
+    let work = Work::new();
+    let input = work.make(
+        "gradient.png",
+        &["-f", "lavfi", "-i", "gradients=size=320x240", "-frames:v", "1"],
+    );
+
+    let mut sizes = Vec::new();
+    for (effort, name) in [(1, "cheap.jxl"), (9, "thorough.jxl")] {
+        let output = work.path(name);
+        convert::encode(
+            Recipe::JxlFromRaster,
+            &input,
+            &output,
+            work.dir.path(),
+            &[],
+            effort,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        sizes.push(size(&output));
+    }
+
+    let (cheap, thorough) = (sizes[0], sizes[1]);
+    assert!(
+        cheap > thorough,
+        "effort 1 produced {cheap} bytes and effort 9 produced {thorough}; \
+         identical or inverted sizes mean the setting never reached cjxl"
+    );
 }
 
 /// Lossless WebP is the one member of the "already efficient" family JXL can
@@ -219,6 +270,7 @@ async fn a_webp_conversion_that_changes_pixels_fails_verification() {
         &output,
         work.dir.path(),
         &[],
+        DEFAULT_RASTER_EFFORT,
         Default::default(),
     )
     .await
@@ -246,7 +298,15 @@ async fn a_damaged_raster_output_fails_verification() {
         &["-f", "lavfi", "-i", "testsrc2=size=320x240:rate=1", "-frames:v", "1", "-vf", "negate"],
     );
     let output = work.path("out.jxl");
-    convert::encode(Recipe::JxlFromRaster, &other, &output, work.dir.path(), &[], Default::default())
+    convert::encode(
+        Recipe::JxlFromRaster,
+        &other,
+        &output,
+        work.dir.path(),
+        &[],
+        DEFAULT_RASTER_EFFORT,
+        Default::default(),
+    )
         .await
         .unwrap();
 
@@ -290,7 +350,15 @@ async fn flac_output_that_does_not_match_the_source_fails() {
 
     let fp = convert::fingerprint(Recipe::Flac, &input).await.unwrap();
     let output = work.path("out.flac");
-    convert::encode(Recipe::Flac, &other, &output, work.dir.path(), &[], Default::default())
+    convert::encode(
+        Recipe::Flac,
+        &other,
+        &output,
+        work.dir.path(),
+        &[],
+        DEFAULT_RASTER_EFFORT,
+        Default::default(),
+    )
         .await
         .unwrap();
 
@@ -335,7 +403,15 @@ async fn verification_works_after_the_source_is_deleted() {
     let output = work.path("out.jxl");
 
     let fp = convert::fingerprint(Recipe::JxlFromJpeg, &input).await.unwrap();
-    convert::encode(Recipe::JxlFromJpeg, &input, &output, work.dir.path(), &[], Default::default())
+    convert::encode(
+        Recipe::JxlFromJpeg,
+        &input,
+        &output,
+        work.dir.path(),
+        &[],
+        DEFAULT_RASTER_EFFORT,
+        Default::default(),
+    )
         .await
         .unwrap();
     std::fs::remove_file(&input).unwrap();

@@ -126,6 +126,10 @@ impl VideoOptions {
 
 /// Encodes `input` to `output` according to `recipe`.
 ///
+/// `raster_effort` reaches both JXL recipes that go through cjxl's generic path;
+/// the JPEG transcode has no equivalent knob, for the reason given on
+/// [`jxl::DEFAULT_RASTER_EFFORT`].
+///
 /// AV1 is absent here: it cannot be separated from its measurement, because the
 /// CRF is chosen by scoring the result. [`convert_av1`] does both.
 pub async fn encode(
@@ -134,12 +138,13 @@ pub async fn encode(
     output: &Path,
     work_dir: &Path,
     cores: &[usize],
+    raster_effort: u8,
     video: VideoOptions,
 ) -> Result<()> {
     match recipe {
         Recipe::JxlFromJpeg => jxl::encode_from_jpeg(input, output, cores).await,
         Recipe::JxlFromRaster | Recipe::JxlFromWebp => {
-            jxl::encode_from_raster(input, output, work_dir, cores).await
+            jxl::encode_from_raster(input, output, work_dir, cores, raster_effort).await
         }
         Recipe::Flac | Recipe::FlacRecompress => audio::encode_flac(input, output, cores).await,
         Recipe::TsRemux => {

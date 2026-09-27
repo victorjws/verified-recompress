@@ -7,9 +7,26 @@ use anyhow::{Result, bail};
 use super::{Fidelity, command, run, try_run};
 use crate::hash;
 
-/// Maximum effort. This is an archival pass, run once per file; the extra time
-/// buys real bytes.
-const EFFORT: &str = "9";
+/// Maximum effort, and not configurable, because there is nothing here to tune.
+///
+/// A lossless JPEG transcode moves the existing DCT coefficients rather than
+/// searching for an encoding, so effort has almost nothing to act on: 10 lands
+/// within +/-20 bytes of 9 across real files, for 0-10% more time. A flag would
+/// only offer a choice that does not change the outcome.
+const JPEG_EFFORT: &str = "10";
+
+/// One below the ceiling, and deliberately so, but only as a starting point:
+/// unlike the JPEG path this is a real lever, and where it lands is a property of
+/// the drive rather than of the format.
+///
+/// Measured at a fixed 1280x720, effort 10 costs between 1.6 and 15.7 seconds per
+/// megapixel depending only on what the image holds, and returns between 0.2% and
+/// 80% — with no relationship between the two. A detailed fractal spends 14s to
+/// save 4%; a flat colour field spends 4s to save 80%. Nothing observable before
+/// encoding predicts which one a file will be, so the choice belongs to whoever
+/// knows the drive. Hence a conservative default and a `--raster-effort` flag,
+/// rather than a number picked here.
+pub const DEFAULT_RASTER_EFFORT: u8 = 9;
 
 /// Losslessly transcodes an existing JPEG.
 ///
@@ -17,7 +34,7 @@ const EFFORT: &str = "9";
 /// JPEG input, but the whole guarantee rests on it, so it is not left implicit.
 pub async fn encode_from_jpeg(input: &Path, output: &Path, cores: &[usize]) -> Result<()> {
     let mut cmd = command("cjxl", cores);
-    cmd.args(["-j", "1", "-d", "0", "-e", EFFORT])
+    cmd.args(["-j", "1", "-d", "0", "-e", JPEG_EFFORT])
         .arg(threads_flag(cores))
         .arg(input)
         .arg(output);
@@ -29,11 +46,15 @@ pub async fn encode_from_jpeg(input: &Path, output: &Path, cores: &[usize]) -> R
 /// cjxl reads none of the WebP family, so one of those is decoded to PNG first.
 /// The intermediate is lossless in both directions, so the pixels reaching cjxl
 /// are the pixels the source held, which is what the verification compares.
+///
+/// `effort` trades encoding time for size; see [`DEFAULT_RASTER_EFFORT`] for why
+/// the caller picks it.
 pub async fn encode_from_raster(
     input: &Path,
     output: &Path,
     work_dir: &Path,
     cores: &[usize],
+    effort: u8,
 ) -> Result<()> {
     let decoded;
     let source = if is_webp(input) {
@@ -45,7 +66,7 @@ pub async fn encode_from_raster(
     };
 
     let mut cmd = command("cjxl", cores);
-    cmd.args(["-d", "0", "-e", EFFORT])
+    cmd.args(["-d", "0", "-e", &effort.to_string()])
         .arg(threads_flag(cores))
         .arg(source)
         .arg(output);

@@ -344,6 +344,7 @@ async fn run_convert(cfg: &Config, args: &RunArgs) -> Result<()> {
             // let that many more be fetching or uploading meanwhile.
             max_in_flight: cfg.cpu_cores + cfg.net_concurrency,
             min_video_secs: cfg.min_video_secs,
+            raster_effort: cfg.raster_effort,
             video: convert::VideoOptions {
                 preset: args.preset,
                 temporal_filtering_off: args.no_temporal_filtering,

@@ -175,6 +175,12 @@ pub struct RunArgs {
     #[arg(long, value_name = "SECONDS")]
     pub min_video_secs: Option<f64>,
 
+    /// cjxl effort for PNG, GIF, BMP, TIFF and lossless WebP, 1 to 10. Higher is
+    /// smaller and much slower, and how much of each depends on the image rather
+    /// than its format. JPEG is unaffected: its transcode is always at 10.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(1..=10))]
+    pub raster_effort: Option<u8>,
+
     /// SVT-AV1 preset. Lower is smaller and slower.
     #[arg(long, value_name = "N")]
     pub preset: Option<u8>,
@@ -221,6 +227,7 @@ impl Cli {
             ov.non_video_cores = args.non_video_cores;
             ov.order = args.order;
             ov.min_video_secs = args.min_video_secs;
+            ov.raster_effort = args.raster_effort;
             ov.trash_policy = args.trash_policy;
             ov.purge_after_days = args.purge_after_days;
         }
