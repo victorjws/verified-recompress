@@ -136,8 +136,12 @@ pub enum SkipReason {
     VideoTooShort,
     /// Multiple video streams, attachments, or other structure we will not risk.
     VideoComplexStructure,
-    /// The AV1 tier is irreversible and needs --allow-video.
+    /// The video tier is off, so no recipe here can run. Decided from the path
+    /// alone, which is the point: judging a video otherwise means downloading it.
     VideoTierDisabled,
+    /// The video tier is on, but AV1 is lossy and irreversible and needs
+    /// --allow-av1 of its own. The lossless video recipes already had their turn.
+    Av1TierDisabled,
     /// Needs a probe before it can be judged; `plan` cannot download.
     NeedsProbe,
     /// Nothing we know how to improve.
@@ -147,7 +151,7 @@ pub enum SkipReason {
 impl SkipReason {
     /// Every reason, so callers can ask about all of them without a list of their
     /// own going stale. `covers_every_reason` holds this to the enum.
-    pub const ALL: [SkipReason; 13] = [
+    pub const ALL: [SkipReason; 14] = [
         SkipReason::AlreadyOptimal,
         SkipReason::NoGain,
         SkipReason::LossyNoGain,
@@ -159,6 +163,7 @@ impl SkipReason {
         SkipReason::VideoTooShort,
         SkipReason::VideoComplexStructure,
         SkipReason::VideoTierDisabled,
+        SkipReason::Av1TierDisabled,
         SkipReason::NeedsProbe,
         SkipReason::Unsupported,
     ];
@@ -178,6 +183,7 @@ impl SkipReason {
         matches!(
             self,
             SkipReason::VideoTierDisabled
+                | SkipReason::Av1TierDisabled
                 | SkipReason::TooLargeForBudget
                 | SkipReason::VideoTooShort
         )
@@ -185,14 +191,18 @@ impl SkipReason {
 
     /// Reasons a run should reconsider, given how it was configured.
     ///
-    /// `video_tier_disabled` is left alone unless video is actually permitted:
-    /// reopening it otherwise means claiming every video on the drive only to
-    /// set it straight back.
-    pub fn reopened_by(allow_video: bool) -> Vec<&'static str> {
+    /// The two tier reasons are each left alone unless their own tier is now
+    /// permitted: reopening them otherwise means claiming every video on the
+    /// drive only to set it straight back.
+    pub fn reopened_by(allow_video: bool, allow_av1: bool) -> Vec<&'static str> {
         Self::ALL
             .iter()
             .filter(|reason| reason.depends_on_settings())
-            .filter(|reason| allow_video || **reason != SkipReason::VideoTierDisabled)
+            .filter(|reason| match reason {
+                SkipReason::VideoTierDisabled => allow_video,
+                SkipReason::Av1TierDisabled => allow_av1,
+                _ => true,
+            })
             .map(|reason| reason.as_str())
             .collect()
     }
@@ -210,6 +220,7 @@ impl SkipReason {
             SkipReason::VideoTooShort => "video_too_short",
             SkipReason::VideoComplexStructure => "video_complex_structure",
             SkipReason::VideoTierDisabled => "video_tier_disabled",
+            SkipReason::Av1TierDisabled => "av1_tier_disabled",
             SkipReason::NeedsProbe => "needs_probe",
             SkipReason::Unsupported => "unsupported",
         }
@@ -242,8 +253,12 @@ impl Decision {
 pub struct Limits {
     /// Largest input we can stage, in bytes.
     pub max_file_bytes: u64,
-    /// Whether the irreversible AV1 tier is permitted.
+    /// Whether video is converted at all. Off, and no video file is even looked
+    /// at, which is what keeps them from being downloaded to be judged.
     pub allow_video: bool,
+    /// Whether the irreversible AV1 tier is permitted within that. The lossless
+    /// video recipes do not need it.
+    pub allow_av1: bool,
     /// Videos shorter than this are left alone. Zero means no floor.
     pub min_video_secs: f64,
 }
@@ -255,6 +270,7 @@ impl Limits {
         Self {
             max_file_bytes: u64::MAX,
             allow_video: true,
+            allow_av1: true,
             min_video_secs: 0.0,
         }
     }
@@ -388,6 +404,13 @@ pub fn decide(facts: Facts<'_>, limits: Limits) -> Decision {
 }
 
 fn decide_video(kind: Kind, probe: Option<&MediaProbe>, limits: Limits) -> Decision {
+    // Ahead of the probe, deliberately. Probing means downloading the file, and
+    // with the tier off there is no recipe any codec could reach — so asking
+    // would cost the whole file to learn nothing that changes the answer.
+    if !limits.allow_video {
+        return Decision::Skip(SkipReason::VideoTierDisabled);
+    }
+
     let Some(probe) = probe else {
         return Decision::Skip(SkipReason::NeedsProbe);
     };
@@ -447,12 +470,12 @@ fn decide_video(kind: Kind, probe: Option<&MediaProbe>, limits: Limits) -> Decis
             Decision::Skip(SkipReason::VideoLowBitrate)
         };
     }
-    if !limits.allow_video {
+    if !limits.allow_av1 {
         // The lossless remux is still allowed: it needs no quality judgement.
         return if kind == Kind::MpegTs {
             ts_fallback
         } else {
-            Decision::Skip(SkipReason::VideoTierDisabled)
+            Decision::Skip(SkipReason::Av1TierDisabled)
         };
     }
 
@@ -507,13 +530,26 @@ mod tests {
         Limits {
             max_file_bytes: 20 * 1024 * 1024 * 1024,
             allow_video: true,
+            allow_av1: true,
             min_video_secs: DEFAULT_MIN_VIDEO_SECS,
         }
     }
 
+    /// The video tier off entirely: nothing here may be converted, and nothing
+    /// may be downloaded to find out.
     fn no_video() -> Limits {
         Limits {
             allow_video: false,
+            allow_av1: false,
+            ..limits()
+        }
+    }
+
+    /// The lossless video recipes on, AV1 off. The default shape of a run that
+    /// passes `--allow-video` alone.
+    fn no_av1() -> Limits {
+        Limits {
+            allow_av1: false,
             ..limits()
         }
     }
@@ -557,6 +593,7 @@ mod tests {
                 | SkipReason::VideoTooShort
                 | SkipReason::VideoComplexStructure
                 | SkipReason::VideoTierDisabled
+                | SkipReason::Av1TierDisabled
                 | SkipReason::NeedsProbe
                 | SkipReason::Unsupported => (),
             };
@@ -573,6 +610,7 @@ mod tests {
         for reason in [
             SkipReason::TooLargeForBudget,
             SkipReason::VideoTierDisabled,
+            SkipReason::Av1TierDisabled,
             SkipReason::VideoTooShort,
         ] {
             assert!(reason.depends_on_settings(), "{}", reason.as_str());
@@ -590,13 +628,25 @@ mod tests {
         }
     }
 
+    /// Each tier reason answers to its own flag. Reopening `video_tier_disabled`
+    /// with video still off would claim every video on the drive only to set it
+    /// straight back, and the same goes for AV1 one level down.
     #[test]
-    fn the_video_tier_is_only_reopened_when_it_is_permitted() {
-        let without = SkipReason::reopened_by(false);
-        assert!(!without.contains(&"video_tier_disabled"));
-        assert!(without.contains(&"too_large_for_budget"));
-        assert!(without.contains(&"video_too_short"));
-        assert!(SkipReason::reopened_by(true).contains(&"video_tier_disabled"));
+    fn each_tier_is_only_reopened_when_that_tier_is_permitted() {
+        let neither = SkipReason::reopened_by(false, false);
+        assert!(!neither.contains(&"video_tier_disabled"));
+        assert!(!neither.contains(&"av1_tier_disabled"));
+        // Reasons that answer to other settings are reopened regardless.
+        assert!(neither.contains(&"too_large_for_budget"));
+        assert!(neither.contains(&"video_too_short"));
+
+        let lossless_only = SkipReason::reopened_by(true, false);
+        assert!(lossless_only.contains(&"video_tier_disabled"));
+        assert!(!lossless_only.contains(&"av1_tier_disabled"));
+
+        let everything = SkipReason::reopened_by(true, true);
+        assert!(everything.contains(&"video_tier_disabled"));
+        assert!(everything.contains(&"av1_tier_disabled"));
     }
 
     #[test]
@@ -750,9 +800,37 @@ mod tests {
     #[test]
     fn av1_tier_requires_explicit_permission() {
         assert_eq!(
-            decide(Facts::new("a.mp4", BIG).with_probe(&phone_clip()), no_video()),
-            Decision::Skip(SkipReason::VideoTierDisabled)
+            decide(Facts::new("a.mp4", BIG).with_probe(&phone_clip()), no_av1()),
+            Decision::Skip(SkipReason::Av1TierDisabled)
         );
+    }
+
+    /// The point of the tier switch: with video off the verdict comes from the
+    /// path, so the bytes are never fetched. Judging a video otherwise means
+    /// probing it, and probing means downloading the whole file — for an answer
+    /// that cannot change.
+    #[test]
+    fn video_is_skipped_without_a_probe_when_the_tier_is_off() {
+        for path in ["a.mp4", "a.m4v", "a.mkv", "a.mov", "a.avi", "a.ts", "a.webm"] {
+            assert_eq!(
+                decide(Facts::new(path, BIG), no_video()),
+                Decision::Skip(SkipReason::VideoTierDisabled),
+                "{path}"
+            );
+        }
+    }
+
+    /// The lossless recipes still need the bytes, so with only AV1 withheld the
+    /// same files defer rather than being decided outright.
+    #[test]
+    fn video_still_defers_for_a_probe_when_only_av1_is_off() {
+        for path in ["a.mp4", "a.mkv", "a.mov", "a.ts"] {
+            assert_eq!(
+                decide(Facts::new(path, BIG), no_av1()),
+                Decision::Skip(SkipReason::NeedsProbe),
+                "{path}"
+            );
+        }
     }
 
     #[test]
@@ -898,12 +976,13 @@ mod tests {
         }
     }
 
-    /// FFV1 is lossless, so it does not need the --allow-video gate.
+    /// FFV1 is lossless, so it does not need the --allow-av1 gate. It does need
+    /// the video tier itself, which is what --allow-video turns on.
     #[test]
-    fn ffv1_does_not_need_the_video_gate() {
+    fn ffv1_does_not_need_the_av1_gate() {
         let probe = video("rawvideo", 1920, 1080, 100_000_000, 120.0);
         assert_eq!(
-            decide(Facts::new("a.mov", BIG).with_probe(&probe), no_video()),
+            decide(Facts::new("a.mov", BIG).with_probe(&probe), no_av1()),
             Decision::Convert(Recipe::Ffv1)
         );
     }
@@ -953,9 +1032,9 @@ mod tests {
     }
 
     #[test]
-    fn transport_streams_remux_even_without_the_video_gate() {
+    fn transport_streams_remux_even_without_the_av1_gate() {
         assert_eq!(
-            decide(Facts::new("a.ts", BIG).with_probe(&phone_clip()), no_video()),
+            decide(Facts::new("a.ts", BIG).with_probe(&phone_clip()), no_av1()),
             Decision::Convert(Recipe::TsRemux)
         );
     }
@@ -1053,7 +1132,7 @@ mod tests {
             Facts::new("rec.ts", BIG)
                 .with_head(&ts)
                 .with_probe(&phone_clip()),
-            no_video(),
+            no_av1(),
         );
         assert_eq!(decision, Decision::Convert(Recipe::TsRemux));
     }

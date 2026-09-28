@@ -78,8 +78,10 @@ enum Outcome {
 pub struct Options {
     /// Without this nothing on the remote is written to or deleted.
     pub execute: bool,
-    /// Permits the irreversible AV1 tier.
+    /// Permits the video tier at all. Off, and no video file is downloaded.
     pub allow_video: bool,
+    /// Permits the irreversible AV1 tier within it.
+    pub allow_av1: bool,
     /// Stop after this many files.
     pub limit: Option<usize>,
     /// Which files this run may touch.
@@ -342,6 +344,7 @@ impl<R: Remote + 'static> Pipeline<R> {
         let limits = Limits {
             max_file_bytes: self.max_file_bytes,
             allow_video: opts.allow_video,
+            allow_av1: opts.allow_av1,
             min_video_secs: opts.min_video_secs,
         };
 

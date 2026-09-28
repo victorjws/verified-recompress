@@ -30,7 +30,11 @@ The safety rules that follow from this:
 - **Deleted means "in the Filen trash".** The trash still counts against your quota. The default
   `trash_policy` is `keep`, so your usage will not drop until you run `cleanup --execute`. Until
   then every original is recoverable from the Filen web app.
-- **AV1 is the only lossy path, and it is off by default.** It requires `--allow-video`, and each
+- **Video is not touched, or even downloaded, without `--allow-video`.** Judging a video means
+  probing it and probing means fetching it, so with the tier off the verdict is reached from the
+  path alone and no video leaves the remote. `--allow-video` permits the two lossless video
+  recipes; AV1 needs `--allow-av1` on top.
+- **AV1 is the only lossy path, and it is off by default.** It requires `--allow-av1`, and each
   encode must clear a measured VMAF gate: mean >= 97.0 and 1st percentile >= 95.0, scored with
   `vmaf_v0.6.1` (or `vmaf_4k_v0.6.1` above 1080p). `ab-av1 crf-search` finds the CRF that meets
   the floor rather than assuming one. An encode that misses the gate is discarded, not uploaded.
@@ -114,7 +118,7 @@ For video, insert a measurement pass before opening the tier up:
 
 ```sh
 verified-recompress bench --sample 5                      # compare presets on your own files
-verified-recompress run --path /Videos --allow-video --preset 4 --execute
+verified-recompress run --path /Videos --allow-av1 --preset 4 --execute
 ```
 
 ## Commands
@@ -252,7 +256,8 @@ nothing to the remote.
 | `--execute` | actually modify the remote |
 | `--all` | required for an `--execute` run with no `--path` |
 | `--retry-failed` | return previously failed files to pending and try them again |
-| `--allow-video` | permit the irreversible AV1 tier |
+| `--allow-video` | convert video at all. Without it no video file is downloaded. Permits the lossless recipes only: the MPEG-TS remux and FFV1 |
+| `--allow-av1` | also permit AV1, which is lossy and **cannot be undone**. Implies `--allow-video` |
 | `--limit N` | stop after N files |
 | `--staging-dir DIR` | local scratch directory |
 | `--keep-originals DIR` | leave a copy of each original here before its replacement takes over |
@@ -544,7 +549,8 @@ drive still full" is answerable from `plan` and `report`.
 | `video_low_bitrate` | already below 1.0 bits/pixel/second (roughly 1080p at 2 Mbps, 4K at 8 Mbps) |
 | `video_too_short` | shorter than `min_video_secs`; off by default |
 | `video_complex_structure` | multiple video streams or attachments a straight re-encode would mangle |
-| `video_tier_disabled` | needs `--allow-video` |
+| `video_tier_disabled` | needs `--allow-video`. Reached from the path, so the file is never fetched |
+| `av1_tier_disabled` | video is permitted but no lossless recipe fits, and AV1 needs `--allow-av1` |
 | `needs_probe` | a video that `plan` cannot judge without downloading it |
 | `unsupported` | nothing here is known to be improvable |
 | `out_of_scope` | excluded by `--path` or `--exclude` |
@@ -554,10 +560,12 @@ original's exact bytes, and are dropped as `no_gain`. That is a different answer
 `already_optimal`, which is reached from the file's name before anything is fetched: one says the
 work was done and the file did not shrink, the other says it was never attempted.
 
-Two reasons depend on how the run was configured rather than on the file: `video_tier_disabled`
-and `too_large_for_budget`. Those are automatically reconsidered on the next run when the settings
-change, so turning on `--allow-video` does not silently do nothing to files it already passed
-over.
+Four reasons depend on how the run was configured rather than on the file: `video_tier_disabled`,
+`av1_tier_disabled`, `video_too_short` and `too_large_for_budget`. Those are automatically
+reconsidered on the next run when the settings change, so turning on `--allow-video` does not
+silently do nothing to files it already passed over. The two tier reasons each answer to their own
+flag: `--allow-video` reopens the first, `--allow-av1` the second, and neither reopens the other,
+because claiming every video on the drive only to set it straight back is not free.
 
 ## Status and caveats
 
@@ -568,7 +576,7 @@ is still outstanding. Treat the first real run accordingly:
 2. `scan` and `plan`, both read-only, to see the projected saving.
 3. A narrow `run --path ... --limit 10 --execute` with `trash_policy = "keep"`.
 4. `verify`, then `cleanup --execute` once you are satisfied.
-5. `bench --sample 5` to settle on a preset before opening up `--allow-video`.
+5. `bench --sample 5` to settle on a preset before opening up `--allow-av1`.
 
 Other things worth knowing:
 
@@ -577,6 +585,9 @@ Other things worth knowing:
 - CPU budgeting relies on `taskset`, so it is enforced on Linux only.
 - Video encoding is SVT-AV1 software only. NVENC is not used: at equal quality its output runs
   30-45% larger. The GPU is used for decoding during VMAF scoring, if available.
+- `--allow-video` used to mean "permit AV1", and now means "convert video at all". A run that
+  passed it to get AV1 encodes will get only the lossless video recipes until it says
+  `--allow-av1` instead.
 - `--allow-discard-corrupt` makes an MPEG-TS remux lossy. It exists for genuinely damaged
   captures, and it is off by default.
 - The Filen trash counts against your quota until `cleanup --execute`.
@@ -584,7 +595,7 @@ Other things worth knowing:
 ## Development
 
 ```sh
-cargo test          # 364 tests
+cargo test          # 370 tests
 cargo build --release
 ```
 

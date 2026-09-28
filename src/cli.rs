@@ -106,9 +106,16 @@ pub struct RunArgs {
     #[arg(long)]
     pub all: bool,
 
-    /// Allow the AV1 video tier, which is not reversible.
+    /// Convert video at all. Without it no video file is downloaded, because
+    /// judging one means probing it. This permits only the lossless recipes:
+    /// the MPEG-TS remux and FFV1.
     #[arg(long)]
     pub allow_video: bool,
+
+    /// Also permit AV1, the one conversion in this tool that loses data and
+    /// cannot be undone. Implies --allow-video.
+    #[arg(long)]
+    pub allow_av1: bool,
 
     /// Stop after this many files.
     #[arg(long)]
@@ -201,6 +208,17 @@ pub struct RunArgs {
     /// Days to keep trash before purging, with --trash-policy purge-after-days.
     #[arg(long, value_name = "DAYS")]
     pub purge_after_days: Option<u32>,
+}
+
+impl RunArgs {
+    /// Whether video is converted at all.
+    ///
+    /// `--allow-av1` names a recipe inside the video tier, so asking for it and
+    /// being told the tier is off would be a rule with no purpose. It turns the
+    /// tier on rather than requiring both flags.
+    pub fn video_allowed(&self) -> bool {
+        self.allow_video || self.allow_av1
+    }
 }
 
 impl Cli {

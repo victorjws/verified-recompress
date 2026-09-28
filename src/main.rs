@@ -191,8 +191,11 @@ async fn run_plan(cfg: &Config) -> Result<()> {
     let limits = Limits {
         max_file_bytes: u64::from(cfg.max_file_mib) * 1024 * 1024,
         // `plan` reports what the lossless tiers alone would do; the AV1 tier needs
-        // both a probe and --allow-video, so including it here would overpromise.
-        allow_video: false,
+        // both a probe and --allow-av1, so including it here would overpromise.
+        // The video tier itself stays on, or every video would read as skipped
+        // rather than as the "cannot say without the bytes" it actually is.
+        allow_video: true,
+        allow_av1: false,
         min_video_secs: cfg.min_video_secs,
     };
 
@@ -240,7 +243,7 @@ async fn run_convert(cfg: &Config, args: &RunArgs) -> Result<()> {
         tracing::info!("returning {retried} previously failed file(s) to pending");
     }
 
-    let mut reopen = SkipReason::reopened_by(args.allow_video);
+    let mut reopen = SkipReason::reopened_by(args.video_allowed(), args.allow_av1);
     reopen.push(pipeline::OUT_OF_SCOPE);
     let reopened = ledger.reopen_skipped(&reopen).await?;
     if reopened > 0 {
@@ -330,7 +333,8 @@ async fn run_convert(cfg: &Config, args: &RunArgs) -> Result<()> {
     let summary = pipeline
         .run(pipeline::Options {
             execute: args.execute,
-            allow_video: args.allow_video,
+            allow_video: args.video_allowed(),
+            allow_av1: args.allow_av1,
             limit: args.limit,
             scope: Scope::new(&cfg.paths, &cfg.exclude)?,
             order: cfg.order,
