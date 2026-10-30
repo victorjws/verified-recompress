@@ -2,9 +2,10 @@
 
 use std::path::Path;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 use super::{Fidelity, command, run, try_run};
+use crate::classify::{ImageFormat, sniff_image};
 use crate::hash;
 
 /// Maximum effort, and not configurable, because there is nothing here to tune.
@@ -43,9 +44,21 @@ pub async fn encode_from_jpeg(input: &Path, output: &Path, cores: &[usize]) -> R
 
 /// Losslessly encodes PNG, GIF, BMP, TIFF, or lossless WebP.
 ///
-/// cjxl reads none of the WebP family, so one of those is decoded to PNG first.
-/// The intermediate is lossless in both directions, so the pixels reaching cjxl
-/// are the pixels the source held, which is what the verification compares.
+/// What the file *is* decides the route, not what it is called. cjxl reads PNG,
+/// GIF and JPEG and nothing else, and says only "Getting pixel data failed" to
+/// everything it does not recognise, which is what a WebP saved as `.png`, a BMP
+/// or a TIFF all produce. So:
+///
+/// - WebP is expanded to PNG with `dwebp`, libwebp's own decoder.
+/// - PNG and GIF go to cjxl directly, and if cjxl still refuses one (libjxl is
+///   stricter than most decoders about damaged chunks) it is retried through
+///   ffmpeg, which already read the file to fingerprint it.
+/// - Anything else goes through ffmpeg.
+///
+/// The ffmpeg intermediate is a lossless PNG of the first frame, so pixels,
+/// bit depth, alpha and colour profile survive; EXIF and text chunks do not.
+/// Verification compares against the source's own pixels, so an intermediate that
+/// lost something would fail there rather than be accepted.
 ///
 /// `effort` trades encoding time for size; see [`DEFAULT_RASTER_EFFORT`] for why
 /// the caller picks it.
@@ -56,31 +69,82 @@ pub async fn encode_from_raster(
     cores: &[usize],
     effort: u8,
 ) -> Result<()> {
-    let decoded;
-    let source = if is_webp(input) {
-        decoded = work_dir.join("webp-decoded.png");
-        decode_webp(input, &decoded, cores).await?;
-        decoded.as_path()
-    } else {
-        input
+    let format = sniff_file(input).await;
+    let intermediate = work_dir.join("raster-decoded.png");
+
+    let result = match format {
+        Some(ImageFormat::Webp) => {
+            let decoded = decode_webp(input, &intermediate, cores).await;
+            match decoded {
+                Ok(()) => cjxl_raster(&intermediate, output, cores, effort).await,
+                Err(e) => Err(e),
+            }
+        }
+        Some(ImageFormat::Png | ImageFormat::Gif) => {
+            match cjxl_raster(input, output, cores, effort).await {
+                Ok(()) => Ok(()),
+                Err(direct) => {
+                    tracing::debug!("{}: retrying through ffmpeg: {direct:#}", input.display());
+                    let _ = tokio::fs::remove_file(output).await;
+                    via_ffmpeg(input, output, &intermediate, cores, effort)
+                        .await
+                        .map_err(|fallback| {
+                            anyhow::anyhow!("{direct:#}; the ffmpeg fallback also failed: {fallback:#}")
+                        })
+                }
+            }
+        }
+        _ => via_ffmpeg(input, output, &intermediate, cores, effort).await,
     };
 
+    let _ = tokio::fs::remove_file(&intermediate).await;
+    result.with_context(|| content_note(input, format))
+}
+
+async fn cjxl_raster(source: &Path, output: &Path, cores: &[usize], effort: u8) -> Result<()> {
     let mut cmd = command("cjxl", cores);
     cmd.args(["-d", "0", "-e", &effort.to_string()])
         .arg(threads_flag(cores))
         .arg(source)
         .arg(output);
-    let result = run(cmd, "cjxl (raster)").await;
-
-    if source != input {
-        let _ = tokio::fs::remove_file(source).await;
-    }
-    result
+    run(cmd, "cjxl (raster)").await
 }
 
-fn is_webp(path: &Path) -> bool {
-    path.extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("webp"))
+async fn via_ffmpeg(
+    input: &Path,
+    output: &Path,
+    intermediate: &Path,
+    cores: &[usize],
+    effort: u8,
+) -> Result<()> {
+    decode_with_ffmpeg(input, intermediate, cores).await?;
+    cjxl_raster(intermediate, output, cores, effort).await
+}
+
+/// How much of a file is needed to recognise its format.
+const SNIFF_BYTES: usize = 64;
+
+async fn sniff_file(path: &Path) -> Option<ImageFormat> {
+    use tokio::io::AsyncReadExt;
+
+    let mut file = tokio::fs::File::open(path).await.ok()?;
+    let mut buf = [0u8; SNIFF_BYTES];
+    let n = file.read(&mut buf).await.ok()?;
+    sniff_image(&buf[..n])
+}
+
+/// Names what the bytes were against what the file claimed, so a failure that
+/// remains says which kind of file it was.
+fn content_note(input: &Path, format: Option<ImageFormat>) -> String {
+    let ext = input
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    format!(
+        "(content: {}, named .{ext})",
+        format.map_or("unrecognised", ImageFormat::name)
+    )
 }
 
 /// Expands a WebP to PNG. `dwebp` is libwebp's own decoder, so it agrees with
@@ -89,6 +153,27 @@ async fn decode_webp(input: &Path, output: &Path, cores: &[usize]) -> Result<()>
     let mut cmd = command("dwebp", cores);
     cmd.arg("-quiet").arg(input).arg("-o").arg(output);
     run(cmd, "dwebp (webp decode)").await
+}
+
+/// Re-expresses a still image as a PNG with ffmpeg, for the formats cjxl cannot
+/// read. Only the first video stream and frame are kept.
+///
+/// The colour tags ffmpeg infers are cleared. Some decoders invent them — a
+/// TIFF with no colour information comes out tagged "primaries unspecified,
+/// gamma 2.2" — and ffmpeg's PNG encoder writes them as `cICP` and `gAMA`
+/// chunks, which cjxl then refuses with the same "Getting pixel data failed" this
+/// path exists to get around. Samples are untouched; an ICC profile travels
+/// separately and is kept.
+async fn decode_with_ffmpeg(input: &Path, output: &Path, cores: &[usize]) -> Result<()> {
+    const CLEAR_TAGS: &str =
+        "setparams=color_primaries=unknown:color_trc=unknown:colorspace=unknown:range=unknown";
+
+    let mut cmd = command("ffmpeg", cores);
+    cmd.args(["-v", "error", "-y", "-i"])
+        .arg(input)
+        .args(["-map", "0:v:0", "-frames:v", "1", "-vf", CLEAR_TAGS, "-c:v", "png"])
+        .arg(output);
+    run(cmd, "ffmpeg (decode to png)").await
 }
 
 fn threads_flag(cores: &[usize]) -> String {

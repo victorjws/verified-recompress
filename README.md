@@ -22,6 +22,13 @@ converted without one.
 | `ffv1` | rawvideo, huffyuv, utvideo, … | MKV | content-exact: truly lossless, around 93% smaller |
 | `av1` | other lossy video | source container | **lossy.** Gated, opt-in, irreversible |
 
+Images are routed by what their bytes are, not by their extension: a WebP saved as `.png` is
+converted as a WebP, and a `.jpg` that is really a PNG as a PNG. cjxl reads only PNG, GIF and
+JPEG, so BMP and TIFF, and any PNG or GIF it still refuses, go through an ffmpeg-decoded PNG
+first. That intermediate keeps pixels, bit depth, alpha and any ICC profile, and drops EXIF
+and text chunks and the colour tags (`cICP`, `gAMA`) a decoder inferred. Verification compares
+the result against the source's own pixels, so a conversion that lost any is rejected.
+
 The safety rules that follow from this:
 
 - **Originals are deleted only after the replacement is proven.** The upload is confirmed by its

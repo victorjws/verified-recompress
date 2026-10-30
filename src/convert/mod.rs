@@ -54,6 +54,9 @@ pub struct Fingerprint {
 pub enum ContentHash {
     /// Per-frame hashes of decoded pixels.
     Pixels(String),
+    /// Per-frame hashes taken after converting to `pix_fmt`, which the
+    /// verification must apply to its side as well.
+    PixelsAs { hash: String, pix_fmt: &'static str },
     /// MD5 of decoded PCM samples.
     Pcm(String),
     /// Per-stream digests of encoded data, for verifying a stream copy.
@@ -71,7 +74,15 @@ pub async fn fingerprint(recipe: Recipe, input: &Path) -> Result<Fingerprint> {
         // Byte-exactness is provable on its own, and the JPEG round trip is checked
         // against the file bytes rather than pixels for the reasons in `jxl`.
         Recipe::JxlFromJpeg => None,
-        Recipe::JxlFromRaster => Some(ContentHash::Pixels(hash::frame_hash(input).await?)),
+        // Compared in a format wide enough for any still, because the source
+        // and the decoded JXL rarely agree on channel order (BMP is BGR).
+        Recipe::JxlFromRaster => {
+            let pix_fmt = hash::neutral_pix_fmt(&hash::source_pix_fmt(input).await?);
+            Some(ContentHash::PixelsAs {
+                hash: hash::frame_hash_as(input, pix_fmt).await?,
+                pix_fmt,
+            })
+        }
         // WebP is an 8-bit ARGB format, so normalising costs nothing and makes
         // the comparison against the decoded JXL possible at all.
         Recipe::JxlFromWebp => Some(ContentHash::Pixels(
@@ -193,10 +204,10 @@ pub async fn verify(
     match recipe {
         Recipe::JxlFromJpeg => jxl::verify_jpeg(output, &fingerprint.sha256, work_dir).await,
         Recipe::JxlFromRaster => {
-            let Some(ContentHash::Pixels(expected)) = &fingerprint.content else {
+            let Some(ContentHash::PixelsAs { hash, pix_fmt }) = &fingerprint.content else {
                 bail!("a raster conversion needs a pixel fingerprint");
             };
-            jxl::verify_raster(output, expected, work_dir, None).await
+            jxl::verify_raster(output, hash, work_dir, Some(pix_fmt)).await
         }
         Recipe::JxlFromWebp => {
             let Some(ContentHash::Pixels(expected)) = &fingerprint.content else {

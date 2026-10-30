@@ -122,6 +122,65 @@ pub async fn frame_hash_as(path: &Path, pix_fmt: &str) -> Result<String> {
     frames_from(&raw, path)
 }
 
+/// A pixel format that holds any still of the source's depth without loss, so two
+/// files can be compared by picture rather than by how they lay it out.
+///
+/// BMP decodes as `bgr24` where the PNG a JXL decodes to is `rgb24`, and the same
+/// picture hashes differently in each. Converting both sides to the same format
+/// removes the difference.
+///
+/// Two things keep this honest. Grayscale stays grayscale: turning gray into RGB
+/// and back goes through ffmpeg's luma weighting, which is exactly the kind of
+/// quiet arithmetic this comparison exists to rule out. And 8-bit sources stay
+/// 8-bit, because widening them is not free of surprises: measured, ffmpeg turns
+/// an `argb` WebP into `rgba64le` differently from the identical picture held as
+/// PNG, so an upconversion could fail a perfectly good file.
+pub fn neutral_pix_fmt(source_pix_fmt: &str) -> &'static str {
+    let deep = ["16", "48", "64", "10", "12", "14"]
+        .iter()
+        .any(|bits| source_pix_fmt.contains(bits));
+    let gray = source_pix_fmt.starts_with("gray");
+    let gray_alpha = source_pix_fmt.starts_with("ya");
+    match (gray, gray_alpha, deep) {
+        (true, _, true) => "gray16le",
+        (true, _, false) => "gray",
+        (_, true, true) => "ya16le",
+        (_, true, false) => "ya8",
+        (_, _, true) => "rgba64le",
+        _ => "rgba",
+    }
+}
+
+/// The pixel format ffmpeg decodes the first video stream of `path` to.
+pub async fn source_pix_fmt(path: &Path) -> Result<String> {
+    let mut cmd = Command::new("ffprobe");
+    cmd.args([
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=pix_fmt",
+        "-of",
+        "csv=p=0",
+    ])
+    .arg(path);
+    tracing::debug!("run {}", crate::proc::describe(cmd.as_std()));
+    let output = cmd.output().await.context("failed to execute ffprobe")?;
+    if !output.status.success() {
+        bail!(
+            "ffprobe failed on {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let fmt = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if fmt.is_empty() {
+        bail!("no video stream with a pixel format in {}", path.display());
+    }
+    Ok(fmt)
+}
+
 fn frames_from(raw: &str, path: &Path) -> Result<String> {
     let hashes = extract_hash_lines(raw);
     if hashes.is_empty() {
@@ -209,6 +268,21 @@ fn extract_hash_lines(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn neutral_formats_keep_gray_apart_from_color_and_depth_from_depth() {
+        for narrow in ["rgb24", "bgr24", "bgr0", "pal8", "argb", "monob", "yuv420p"] {
+            assert_eq!(neutral_pix_fmt(narrow), "rgba", "{narrow}");
+        }
+        for deep in ["rgb48be", "rgb48le", "rgba64be", "yuv420p10le"] {
+            assert_eq!(neutral_pix_fmt(deep), "rgba64le", "{deep}");
+        }
+        assert_eq!(neutral_pix_fmt("gray"), "gray");
+        assert_eq!(neutral_pix_fmt("gray16be"), "gray16le");
+        assert_eq!(neutral_pix_fmt("gray10le"), "gray16le");
+        assert_eq!(neutral_pix_fmt("ya8"), "ya8");
+        assert_eq!(neutral_pix_fmt("ya16le"), "ya16le");
+    }
     use std::io::Write;
 
     /// Captured from ffmpeg 9.0.1 on a PNG and on the same image round-tripped

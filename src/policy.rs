@@ -368,6 +368,16 @@ pub fn decide(facts: Facts<'_>, limits: Limits) -> Decision {
         kind = Kind::Other;
     }
 
+    // Extensions lie about images more than anything else: a WebP saved as `.png`
+    // is routine for web and messenger downloads, and cjxl reads neither it nor
+    // BMP or TIFF. When the bytes name a format, they win over the name.
+    if kind.is_image()
+        && let Some(head) = head
+        && let Some(format) = crate::classify::sniff_image(head)
+    {
+        kind = format.kind();
+    }
+
     match kind {
         Kind::Jpeg => Decision::Convert(Recipe::JxlFromJpeg),
 
@@ -668,6 +678,40 @@ mod tests {
         // Pixel-identical is not byte-reversible, and must not claim to be.
         assert!(!Recipe::JxlFromRaster.is_byte_reversible());
         assert!(Recipe::JxlFromRaster.is_lossless());
+    }
+
+    #[test]
+    fn an_image_is_routed_by_its_bytes_not_its_name() {
+        let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".as_slice();
+        let jpeg = [0xFF, 0xD8, 0xFF, 0xE0, 0, 0x10];
+        let heic = b"\0\0\0\x18ftypheic\0\0\0\0".as_slice();
+        let at = |path, head: &[u8]| decide(Facts::new(path, BIG).with_head(head), limits());
+
+        assert_eq!(at("a.png", png), Decision::Convert(Recipe::JxlFromRaster));
+        // Named .png, but a JPEG inside: the byte-exact path applies.
+        assert_eq!(at("a.png", &jpeg), Decision::Convert(Recipe::JxlFromJpeg));
+        // Named .jpg, but a PNG inside: the JPEG transcode would fail on it.
+        assert_eq!(at("a.jpg", png), Decision::Convert(Recipe::JxlFromRaster));
+        assert_eq!(at("a.png", &webp(b"VP8L")), Decision::Convert(Recipe::JxlFromWebp));
+        assert_eq!(at("a.png", &webp(b"VP8 ")), Decision::Skip(SkipReason::LossyNoGain));
+        assert_eq!(at("a.png", heic), Decision::Skip(SkipReason::AlreadyOptimal));
+        // Bytes nobody recognises leave the extension in charge.
+        assert_eq!(at("a.png", b"garbage"), Decision::Convert(Recipe::JxlFromRaster));
+        // Without bytes, as at plan time, the name is all there is.
+        assert_eq!(
+            decide(Facts::new("a.png", BIG), limits()),
+            Decision::Convert(Recipe::JxlFromRaster)
+        );
+    }
+
+    #[test]
+    fn content_sniffing_leaves_non_images_alone() {
+        let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".as_slice();
+        // A `.wav` is not reinterpreted because its bytes look like something else.
+        assert_eq!(
+            decide(Facts::new("a.wav", BIG).with_head(png), limits()),
+            Decision::Convert(Recipe::Flac)
+        );
     }
 
     #[test]

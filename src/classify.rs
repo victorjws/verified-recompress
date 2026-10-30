@@ -47,6 +47,20 @@ pub enum Kind {
 }
 
 impl Kind {
+    /// The still-image kinds, whose extension is checked against the bytes.
+    pub fn is_image(self) -> bool {
+        matches!(
+            self,
+            Kind::Jpeg
+                | Kind::Png
+                | Kind::Gif
+                | Kind::Bmp
+                | Kind::Tiff
+                | Kind::EfficientImage
+                | Kind::Webp
+        )
+    }
+
     pub fn is_video(self) -> bool {
         matches!(
             self,
@@ -82,6 +96,96 @@ pub fn kind_from_extension(path: &str) -> Kind {
         "avi" | "wmv" | "flv" | "3gp" | "mpg" | "mpeg" | "vob" => Kind::LegacyVideo,
         _ => Kind::Other,
     }
+}
+
+/// What an image file's bytes say it is, whatever its name claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageFormat {
+    Png,
+    Gif,
+    Jpeg,
+    Webp,
+    Bmp,
+    Tiff,
+    /// HEIC, HEIF or AVIF.
+    Heif,
+    Jxl,
+}
+
+impl ImageFormat {
+    pub fn kind(self) -> Kind {
+        match self {
+            ImageFormat::Png => Kind::Png,
+            ImageFormat::Gif => Kind::Gif,
+            ImageFormat::Jpeg => Kind::Jpeg,
+            ImageFormat::Webp => Kind::Webp,
+            ImageFormat::Bmp => Kind::Bmp,
+            ImageFormat::Tiff => Kind::Tiff,
+            ImageFormat::Heif | ImageFormat::Jxl => Kind::EfficientImage,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ImageFormat::Png => "png",
+            ImageFormat::Gif => "gif",
+            ImageFormat::Jpeg => "jpeg",
+            ImageFormat::Webp => "webp",
+            ImageFormat::Bmp => "bmp",
+            ImageFormat::Tiff => "tiff",
+            ImageFormat::Heif => "heif",
+            ImageFormat::Jxl => "jxl",
+        }
+    }
+}
+
+/// Identifies an image by its leading bytes.
+///
+/// Files downloaded from the web or a messenger routinely carry the wrong
+/// extension — a WebP saved as `.png` is the common one — and the encoder
+/// picked by name then fails on a format it cannot read. `None` means the bytes
+/// are not a recognised image, which says nothing about the extension.
+pub fn sniff_image(head: &[u8]) -> Option<ImageFormat> {
+    const HEIF_BRANDS: [&[u8; 4]; 10] = [
+        b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"mif1", b"msf1", b"avif", b"avis",
+    ];
+    // The DIB header sizes in use. "BM" alone is two bytes and would claim any
+    // text file that begins with those letters.
+    const BMP_HEADERS: [u32; 7] = [12, 40, 52, 56, 64, 108, 124];
+
+    if head.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some(ImageFormat::Png);
+    }
+    if head.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some(ImageFormat::Jpeg);
+    }
+    if head.starts_with(b"GIF8") {
+        return Some(ImageFormat::Gif);
+    }
+    if head.len() >= 12 && &head[0..4] == b"RIFF" && &head[8..12] == b"WEBP" {
+        return Some(ImageFormat::Webp);
+    }
+    if head.starts_with(b"II*\0") || head.starts_with(b"MM\0*") {
+        return Some(ImageFormat::Tiff);
+    }
+    if head.starts_with(b"BM")
+        && head.len() >= 18
+        && BMP_HEADERS.contains(&u32::from_le_bytes([head[14], head[15], head[16], head[17]]))
+    {
+        return Some(ImageFormat::Bmp);
+    }
+    if head.len() >= 12
+        && &head[4..8] == b"ftyp"
+        && HEIF_BRANDS.iter().any(|b| &head[8..12] == b.as_slice())
+    {
+        return Some(ImageFormat::Heif);
+    }
+    if head.starts_with(&[0xFF, 0x0A])
+        || head.starts_with(&[0, 0, 0, 0x0C, b'J', b'X', b'L', b' ', 0x0D, 0x0A, 0x87, 0x0A])
+    {
+        return Some(ImageFormat::Jxl);
+    }
+    None
 }
 
 /// Distinguishes an MPEG transport stream from a TypeScript source file, both of
@@ -294,6 +398,54 @@ mod tests {
         "format": {"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"2.000000",
                    "bit_rate":"6253416"}
     }"#;
+
+    #[test]
+    fn sniffs_images_by_their_bytes() {
+        let cases: [(&[u8], ImageFormat); 7] = [
+            (b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR", ImageFormat::Png),
+            (&[0xFF, 0xD8, 0xFF, 0xE0, 0, 0x10], ImageFormat::Jpeg),
+            (b"GIF89a\x01\0\x01\0", ImageFormat::Gif),
+            (b"RIFF\x10\0\0\0WEBPVP8L", ImageFormat::Webp),
+            (b"II*\0\x08\0\0\0", ImageFormat::Tiff),
+            (b"MM\0*\0\0\0\x08", ImageFormat::Tiff),
+            (&[0xFF, 0x0A, 0, 0], ImageFormat::Jxl),
+        ];
+        for (head, want) in cases {
+            assert_eq!(sniff_image(head), Some(want), "{head:?}");
+        }
+
+        let mut bmp = b"BM\0\0\0\0\0\0\0\0\x36\0\0\0".to_vec();
+        bmp.extend_from_slice(&40u32.to_le_bytes());
+        assert_eq!(sniff_image(&bmp), Some(ImageFormat::Bmp));
+
+        let heic = b"\0\0\0\x18ftypheic\0\0\0\0";
+        assert_eq!(sniff_image(heic), Some(ImageFormat::Heif));
+        let avif = b"\0\0\0\x1cftypavif\0\0\0\0";
+        assert_eq!(sniff_image(avif), Some(ImageFormat::Heif));
+        let boxed = [0, 0, 0, 0x0C, b'J', b'X', b'L', b' ', 0x0D, 0x0A, 0x87, 0x0A];
+        assert_eq!(sniff_image(&boxed), Some(ImageFormat::Jxl));
+    }
+
+    #[test]
+    fn sniffing_declines_what_it_cannot_vouch_for() {
+        assert_eq!(sniff_image(b""), None);
+        assert_eq!(sniff_image(b"\x89PN"), None);
+        // Text that happens to begin with the BMP magic.
+        assert_eq!(sniff_image(b"BM is a stock ticker, not a bitmap."), None);
+        // An MP4 is an ftyp box too, but not an image brand.
+        assert_eq!(sniff_image(b"\0\0\0\x18ftypisom\0\0\0\0"), None);
+        assert_eq!(sniff_image(b"just some text"), None);
+    }
+
+    #[test]
+    fn sniffed_formats_map_to_kinds() {
+        assert_eq!(ImageFormat::Webp.kind(), Kind::Webp);
+        assert_eq!(ImageFormat::Heif.kind(), Kind::EfficientImage);
+        assert_eq!(ImageFormat::Jxl.kind(), Kind::EfficientImage);
+        assert!(Kind::Png.is_image());
+        assert!(!Kind::Mp4.is_image());
+        assert!(!Kind::Wav.is_image());
+    }
 
     #[test]
     fn maps_extensions() {

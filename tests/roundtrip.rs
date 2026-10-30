@@ -318,6 +318,173 @@ async fn a_damaged_raster_output_fails_verification() {
     );
 }
 
+/// cjxl reads neither BMP nor TIFF, so these used to fail every time with
+/// "Getting pixel data failed". They now go through an ffmpeg-decoded PNG.
+#[tokio::test]
+async fn bmp_and_tiff_round_trip_pixel_identically() {
+    require!("ffmpeg" => "-version", "cjxl" => "--version", "djxl" => "--version");
+    let work = Work::new();
+    let src = ["-f", "lavfi", "-i", "testsrc2=size=320x240", "-frames:v", "1"];
+    let with = |fmt: &'static str| -> Vec<&'static str> {
+        let mut args = vec!["-f", "lavfi", "-i", "testsrc2=size=320x240", "-frames:v", "1"];
+        args.extend(["-pix_fmt", fmt]);
+        args
+    };
+
+    let cases = [
+        ("in.bmp", src.to_vec()),
+        ("in24.tiff", with("rgb24")),
+        ("in48.tiff", with("rgb48le")),
+        ("inalpha.tiff", with("rgba")),
+        ("inalpha64.tiff", with("rgba64le")),
+        ("ingray.tiff", with("gray")),
+        ("inmono.png", with("monob")),
+        ("inpal.png", with("pal8")),
+    ];
+    for (name, args) in cases {
+        let input = work.make(name, &args);
+        let (fidelity, _, _) =
+            round_trip(Recipe::JxlFromRaster, &input, &work, &format!("{name}.jxl")).await;
+        assert_eq!(fidelity, Fidelity::ContentExact, "{name}");
+    }
+}
+
+/// The classic failure: web and messenger downloads that are WebP inside but
+/// named `.png`. Routed by name, cjxl is handed a WebP and gives up.
+#[tokio::test]
+async fn a_webp_named_png_is_converted_by_what_it_is() {
+    require!(
+        "ffmpeg" => "-version",
+        "cwebp" => "-version",
+        "dwebp" => "-version",
+        "cjxl" => "--version",
+        "djxl" => "--version"
+    );
+    let work = Work::new();
+    let png = work.make(
+        "real.png",
+        &["-f", "lavfi", "-i", "testsrc2=size=320x240", "-frames:v", "1"],
+    );
+    let disguised = work.path("disguised.png");
+    let status = Command::new("cwebp")
+        .args(["-quiet", "-lossless"])
+        .arg(&png)
+        .arg("-o")
+        .arg(&disguised)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let head = std::fs::read(&disguised).unwrap();
+    let decision = verified_recompress::policy::decide(
+        verified_recompress::policy::Facts::new("disguised.png", 1 << 20).with_head(&head),
+        verified_recompress::policy::Limits::unbounded(),
+    );
+    let verified_recompress::policy::Decision::Convert(recipe) = decision else {
+        panic!("a lossless WebP should be converted, got {decision:?}");
+    };
+    assert_eq!(recipe, Recipe::JxlFromWebp);
+
+    let (fidelity, _, _) = round_trip(recipe, &disguised, &work, "out.jxl").await;
+    assert_eq!(fidelity, Fidelity::ContentExact);
+
+    // The raster recipe on the same bytes must cope too, rather than depending
+    // on the caller having sniffed first.
+    let (fidelity, _, _) = round_trip(Recipe::JxlFromRaster, &disguised, &work, "out2.jxl").await;
+    assert_eq!(fidelity, Fidelity::ContentExact);
+}
+
+/// A genuine PNG that libjxl refuses. ffmpeg writes the colour tags a decoder
+/// inferred as `cICP`/`gAMA` chunks, and a PNG made from an untagged gray TIFF
+/// carries "primaries unspecified", which cjxl rejects with "Getting pixel data
+/// failed" even though every other tool opens the file. The conversion has to
+/// get past that rather than report the file as failed.
+#[tokio::test]
+async fn a_png_that_cjxl_rejects_still_converts_through_the_ffmpeg_fallback() {
+    require!("ffmpeg" => "-version", "cjxl" => "--version", "djxl" => "--version");
+    let work = Work::new();
+    let tiff = work.make(
+        "gray.tiff",
+        &["-f", "lavfi", "-i", "testsrc2=size=320x240", "-frames:v", "1", "-pix_fmt", "gray"],
+    );
+    let stubborn = work.path("stubborn.png");
+    let status = Command::new("ffmpeg")
+        .args(["-loglevel", "error", "-y", "-i"])
+        .arg(&tiff)
+        .args(["-map", "0:v:0", "-frames:v", "1", "-c:v", "png"])
+        .arg(&stubborn)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    // Without this the test would pass without exercising the fallback at all.
+    let direct = Command::new("cjxl")
+        .args(["-d", "0", "-e", "1"])
+        .arg(&stubborn)
+        .arg(work.path("direct.jxl"))
+        .output()
+        .unwrap();
+    if direct.status.success() {
+        eprintln!("skipping: this cjxl accepts the file, so there is no fallback to test");
+        return;
+    }
+
+    let (fidelity, _, _) = round_trip(Recipe::JxlFromRaster, &stubborn, &work, "out.jxl").await;
+    assert_eq!(fidelity, Fidelity::ContentExact);
+}
+
+/// Grayscale and 16-bit sources are hashed in a normalised format, and that
+/// normalisation must not collapse distinct values: a ramp touching every
+/// level, then the same ramp with a single level moved.
+#[tokio::test]
+async fn gray_and_deep_color_round_trip_and_a_single_changed_value_is_caught() {
+    require!("ffmpeg" => "-version", "cjxl" => "--version", "djxl" => "--version");
+    let work = Work::new();
+    let ramp = |expr: &str| {
+        let lavfi = format!("color=gray:size=256x16,format=gray,geq=lum='{expr}'");
+        vec!["-f".to_string(), "lavfi".into(), "-i".into(), lavfi, "-frames:v".into(), "1".into(), "-pix_fmt".into(), "gray".into()]
+    };
+    let make = |name: &str, expr: &str| {
+        let args = ramp(expr);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        work.make(name, &refs)
+    };
+
+    let gray = make("ramp.png", "X");
+    let (fidelity, _, _) = round_trip(Recipe::JxlFromRaster, &gray, &work, "ramp.jxl").await;
+    assert_eq!(fidelity, Fidelity::ContentExact);
+
+    let deep = work.make(
+        "deep.png",
+        &[
+            "-f", "lavfi", "-i", "testsrc2=size=320x240", "-frames:v", "1", "-pix_fmt", "rgb48be",
+        ],
+    );
+    let (fidelity, _, _) = round_trip(Recipe::JxlFromRaster, &deep, &work, "deep.jxl").await;
+    assert_eq!(fidelity, Fidelity::ContentExact);
+
+    let fp = convert::fingerprint(Recipe::JxlFromRaster, &gray).await.unwrap();
+    let nudged = make("nudged.png", "if(eq(X,100),101,X)");
+    let output = work.path("nudged.jxl");
+    convert::encode(
+        Recipe::JxlFromRaster,
+        &nudged,
+        &output,
+        work.dir.path(),
+        &[],
+        DEFAULT_RASTER_EFFORT,
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        convert::verify(Recipe::JxlFromRaster, &output, &fp, work.dir.path(), &[])
+            .await
+            .is_err(),
+        "one moved level must not verify"
+    );
+}
+
 /// WAV to FLAC. `--keep-foreign-metadata` carries the container's own chunks, so
 /// this reaches byte-exactness rather than stopping at sample identity.
 #[tokio::test]
